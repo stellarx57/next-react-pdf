@@ -86,7 +86,7 @@ module.exports = {
 ```tsx
 'use client';
 
-import PdfViewer from 'next-react-pdf';
+import { PdfViewer } from 'next-react-pdf';
 
 export default function DocumentPage() {
   return (
