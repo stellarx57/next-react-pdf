@@ -98,8 +98,8 @@ const ZOOM_OPTIONS: { label: string; value: number | null; preset: ZoomPreset }[
   { label: '400%',        value: 4.00, preset: 'custom'     },
 ];
 
-// Set default worker URL only if not already configured via configurePdfWorker().
-if (!pdfjs.GlobalWorkerOptions.workerSrc) {
+// Set default worker URL client-side only, if not already configured.
+if (typeof window !== 'undefined' && !pdfjs.GlobalWorkerOptions.workerSrc) {
   pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js';
 }
 
