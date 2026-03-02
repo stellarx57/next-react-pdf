@@ -1,0 +1,82 @@
+{
+  "name": "next-react-pdf",
+  "version": "1.0.0",
+  "description": "A feature-rich, SSR-safe PDF viewer component for Next.js and React with Material-UI — thumbnails, outline, search, zoom, rotation, attachments, full-screen, and more.",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup && node scripts/add-use-client.js",
+    "dev": "tsup --watch",
+    "type-check": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "react",
+    "nextjs",
+    "next.js",
+    "pdf",
+    "pdf-viewer",
+    "react-pdf",
+    "pdfjs",
+    "mui",
+    "material-ui",
+    "typescript",
+    "thumbnails",
+    "outline",
+    "search",
+    "fullscreen",
+    "zoom",
+    "rotation",
+    "ssr-safe",
+    "component"
+  ],
+  "author": "StellarX Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stellarx57/next-react-pdf.git"
+  },
+  "bugs": {
+    "url": "https://github.com/stellarx57/next-react-pdf/issues"
+  },
+  "homepage": "https://github.com/stellarx57/next-react-pdf#readme",
+  "peerDependencies": {
+    "@mui/icons-material": "^5.0.0 || ^6.0.0",
+    "@mui/material": "^5.0.0 || ^6.0.0",
+    "next": "^14.0.0 || ^15.0.0",
+    "pdfjs-dist": "^5.0.0",
+    "react": "^18.0.0 || ^19.0.0",
+    "react-dom": "^18.0.0 || ^19.0.0",
+    "react-pdf": "^9.0.0 || ^10.0.0"
+  },
+  "devDependencies": {
+    "@emotion/react": "^11.11.3",
+    "@emotion/styled": "^11.11.0",
+    "@mui/icons-material": "^6.3.0",
+    "@mui/material": "^6.3.0",
+    "@types/node": "^20.11.0",
+    "@types/react": "^18.2.48",
+    "@types/react-dom": "^18.2.18",
+    "pdfjs-dist": "^5.4.296",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-pdf": "^10.4.1",
+    "tsup": "^8.0.1",
+    "typescript": "^5.3.3"
+  }
+}
