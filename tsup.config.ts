@@ -1,10 +1,16 @@
 import { defineConfig } from 'tsup';
 
 export default defineConfig({
-  entry: ['src/index.ts'],
+  entry: {
+    index:           'src/index.ts',
+    PdfViewerClient: 'src/PdfViewerClient.tsx',
+  },
   format: ['cjs', 'esm'],
   dts: true,
-  splitting: false,
+  // splitting: true lets the dynamic import in PdfViewer.tsx resolve to a real
+  // separate chunk so that consuming bundlers (Next.js / webpack) never pull
+  // PdfViewerClient — and therefore pdfjs-dist — into the server bundle.
+  splitting: true,
   sourcemap: true,
   clean: true,
   external: [
@@ -18,7 +24,6 @@ export default defineConfig({
     '@mui/material/styles',
     'react-pdf',
     'pdfjs-dist',
-    // react-pdf CSS side-effect imports stay as external references
     'react-pdf/dist/Page/AnnotationLayer.css',
     'react-pdf/dist/Page/TextLayer.css',
   ],
