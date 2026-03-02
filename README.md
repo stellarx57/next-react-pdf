@@ -26,6 +26,16 @@ A feature-rich, SSR-safe PDF viewer component for **Next.js** applications built
 npm install next-react-pdf react-pdf pdfjs-dist @mui/material @mui/icons-material @emotion/react @emotion/styled
 ```
 
+> **Important:** Always import `PdfViewer` with `next/dynamic` to keep pdfjs-dist out of the server bundle:
+>
+> ```tsx
+> import dynamic from 'next/dynamic';
+> const PdfViewer = dynamic(
+>   () => import('next-react-pdf').then((m) => ({ default: m.PdfViewer })),
+>   { ssr: false },
+> );
+> ```
+
 > `react-pdf` and `pdfjs-dist` are peer dependencies and must be installed alongside this package.
 
 ## Setup
@@ -136,9 +146,11 @@ import { PdfViewerClient } from 'next-react-pdf';
 | `react-dom`               | ^18.0.0 \| ^19.0.0 |
 | `next`                    | ^14.0.0 \| ^15.0.0 |
 | `react-pdf`               | ^9.0.0 \| ^10.0.0  |
-| `pdfjs-dist`              | ^4.0.0           |
+| `pdfjs-dist`              | ^5.0.0           |
 | `@mui/material`           | ^5.0.0 \| ^6.0.0  |
 | `@mui/icons-material`     | ^5.0.0 \| ^6.0.0  |
+| `@emotion/react`          | ^11.0.0          |
+| `@emotion/styled`         | ^11.0.0          |
 
 ## License
 

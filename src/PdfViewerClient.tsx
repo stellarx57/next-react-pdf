@@ -4,7 +4,7 @@ import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 
 import React, {
-  useCallback, useEffect, useRef, useState,
+  useCallback, useEffect, useMemo, useRef, useState,
   type ChangeEvent, type DragEvent, type KeyboardEvent,
 } from 'react';
 
@@ -26,7 +26,7 @@ import {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export interface PdfViewerProps {
-  /** Fully-qualified URL or blob URL of the PDF to display. */
+  /** URL or blob URL of the PDF to display. Pass `null` for an empty state. */
   fileUrl: string | null;
   /** Display name used in the toolbar and for download. Defaults to `'document.pdf'`. */
   fileName?: string;
@@ -34,7 +34,7 @@ export interface PdfViewerProps {
   onDocumentLoad?: (numPages: number) => void;
 }
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Internal types ───────────────────────────────────────────────────────────
 
 type SidebarTab = 'thumbnails' | 'outline' | 'attachments';
 type ScrollMode = 'continuous' | 'single';
@@ -59,13 +59,14 @@ interface PdfProperties {
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
 
-const THEME = {
+const T = {
   toolbarBg:     '#FFFFFF',
   toolbarBorder: '#DDE3EF',
   sidebarBg:     '#F4F6FB',
   sidebarTabBg:  '#EBF0FA',
   viewerBg:      '#E8EDF6',
   blue:          '#1565C0',
+  blueDark:      '#0D47A1',
   blueHover:     'rgba(21,101,192,0.07)',
   blueActive:    'rgba(21,101,192,0.13)',
   textPrimary:   '#263238',
@@ -78,12 +79,15 @@ const THEME = {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const SIDEBAR_WIDTH  = 220;
-const TOOLBAR_HEIGHT = 48;
+const SIDEBAR_W      = 220;
+const TOOLBAR_H      = 48;
+const VIEWER_PADDING = 48;     // horizontal + vertical padding inside viewer box
 const ZOOM_MIN       = 0.25;
 const ZOOM_MAX       = 4.0;
 const ZOOM_STEP      = 0.25;
-const THUMB_WIDTH    = 140;
+const THUMB_W        = 140;
+const SEARCH_DEBOUNCE_MS = 350;
+
 const ZOOM_OPTIONS: { label: string; value: number | null; preset: ZoomPreset }[] = [
   { label: 'Page Fit',    value: null, preset: 'page-fit'   },
   { label: 'Page Width',  value: null, preset: 'page-width' },
@@ -106,17 +110,22 @@ if (typeof window !== 'undefined' && !pdfjs.GlobalWorkerOptions.workerSrc) {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function escHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
+/** Returns HTML with matched query wrapped in <mark>. XSS-safe via escaping. */
 function highlightText(str: string, query: string): string {
   if (!query.trim()) return escHtml(str);
-  const escaped      = escHtml(str);
-  const escapedQuery = escHtml(query.trim());
-  if (!escapedQuery) return escaped;
+  const escaped = escHtml(str);
+  const q       = escHtml(query.trim());
+  if (!q) return escaped;
   try {
-    const regex = new RegExp(`(${escapedQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
-    return escaped.replace(regex, '<mark style="background:#FFEB3B;color:#000;border-radius:2px">$1</mark>');
+    const re = new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    return escaped.replace(re, '<mark style="background:#FFEB3B;color:#000;border-radius:2px">$1</mark>');
   } catch {
     return escaped;
   }
@@ -124,8 +133,8 @@ function highlightText(str: string, query: string): string {
 
 function formatDate(raw: string | undefined): string {
   if (!raw) return '—';
-  const match = raw.match(/D:(\d{4})(\d{2})(\d{2})/);
-  if (match) return `${match[1]}-${match[2]}-${match[3]}`;
+  const m = raw.match(/D:(\d{4})(\d{2})(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
   return raw;
 }
 
@@ -135,7 +144,33 @@ function formatBytes(n: number): string {
   return `${(n / 1048576).toFixed(1)} MB`;
 }
 
-// ─── Sub-components ───────────────────────────────────────────────────────────
+// ─── Shared toolbar button ────────────────────────────────────────────────────
+// Defined at module level so React never re-mounts it due to reference changes.
+
+const BTN_SX  = { color: T.textIcon, padding: '4px', '&:hover': { color: T.blue, backgroundColor: T.blueHover } };
+const ACTV_SX = { color: T.blue, backgroundColor: T.blueActive };
+
+interface BtnProps {
+  title: string;
+  onClick: () => void;
+  active?: boolean;
+  disabled?: boolean;
+  children: React.ReactNode;
+}
+function Btn({ title, onClick, active = false, disabled = false, children }: BtnProps) {
+  return (
+    <Tooltip title={title} arrow placement="bottom">
+      <span>
+        <IconButton size="small" onClick={onClick} disabled={disabled}
+          sx={active ? [BTN_SX, ACTV_SX] : BTN_SX}>
+          {children}
+        </IconButton>
+      </span>
+    </Tooltip>
+  );
+}
+
+// ─── Toolbar ─────────────────────────────────────────────────────────────────
 
 interface ToolbarProps {
   numPages:       number;
@@ -171,6 +206,8 @@ interface ToolbarProps {
   onSearchToggle: () => void;
 }
 
+const DIVIDER_SX = { borderColor: T.border, mx: 0.5, height: 24, alignSelf: 'center' };
+
 function Toolbar(p: ToolbarProps) {
   const [pageInput, setPageInput] = useState(String(p.currentPage));
   useEffect(() => setPageInput(String(p.currentPage)), [p.currentPage]);
@@ -180,43 +217,26 @@ function Toolbar(p: ToolbarProps) {
     if (!isNaN(n) && n >= 1 && n <= p.numPages) p.onPageInput(n);
     else setPageInput(String(p.currentPage));
   };
-
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') commitPage();
   };
 
+  // 'Actual Size' preset must match the ZOOM_OPTIONS label exactly.
   const zoomLabel =
-    p.zoomPreset === 'page-fit'   ? 'Page Fit'   :
-    p.zoomPreset === 'page-width' ? 'Page Width' :
-    p.zoomPreset === 'actual'     ? '100%'        :
+    p.zoomPreset === 'page-fit'   ? 'Page Fit'    :
+    p.zoomPreset === 'page-width' ? 'Page Width'  :
+    p.zoomPreset === 'actual'     ? 'Actual Size' :
     `${Math.round(p.scale * 100)}%`;
 
-  const sx = {
-    wrapper: {
-      height: TOOLBAR_HEIGHT, display: 'flex', alignItems: 'center',
-      px: 0.5, gap: 0.25, backgroundColor: THEME.toolbarBg,
-      borderBottom: `1px solid ${THEME.toolbarBorder}`, flexShrink: 0, overflowX: 'auto',
-      boxShadow: '0 1px 3px rgba(21,101,192,0.07)',
-    } as const,
-    btn:     { color: THEME.textIcon, padding: '4px', '&:hover': { color: THEME.blue, backgroundColor: THEME.blueHover } },
-    active:  { color: THEME.blue, backgroundColor: THEME.blueActive },
-    divider: { borderColor: THEME.border, mx: 0.5, height: 24, alignSelf: 'center' },
-  };
-
-  const Btn = ({ title, onClick, active = false, disabled = false, children }: {
-    title: string; onClick: () => void; active?: boolean; disabled?: boolean; children: React.ReactNode;
-  }) => (
-    <Tooltip title={title} arrow placement="bottom">
-      <span>
-        <IconButton size="small" onClick={onClick} disabled={disabled} sx={[sx.btn, active && sx.active]}>
-          {children}
-        </IconButton>
-      </span>
-    </Tooltip>
-  );
-
   return (
-    <Box sx={sx.wrapper} role="toolbar" aria-label="PDF viewer toolbar">
+    <Box sx={{
+      height: TOOLBAR_H, display: 'flex', alignItems: 'center',
+      px: 0.5, gap: 0.25, backgroundColor: T.toolbarBg,
+      borderBottom: `1px solid ${T.toolbarBorder}`, flexShrink: 0, overflowX: 'auto',
+      boxShadow: '0 1px 3px rgba(21,101,192,0.07)',
+    }} role="toolbar" aria-label="PDF viewer toolbar">
+
+      {/* Sidebar toggles */}
       <Btn title="Thumbnails" onClick={() => p.onSidebarTab('thumbnails')} active={p.sidebarOpen && p.sidebarTab === 'thumbnails'}>
         <ViewStreamOutlined sx={{ fontSize: 18 }} />
       </Btn>
@@ -227,15 +247,15 @@ function Toolbar(p: ToolbarProps) {
         <AttachFileOutlined sx={{ fontSize: 18 }} />
       </Btn>
 
-      <Divider orientation="vertical" sx={sx.divider} />
+      <Divider orientation="vertical" sx={DIVIDER_SX} />
 
+      {/* Page navigation */}
       <Btn title="First page (Home)" onClick={p.onFirstPage} disabled={p.currentPage <= 1}>
         <FirstPageOutlined sx={{ fontSize: 18 }} />
       </Btn>
       <Btn title="Previous page (↑)" onClick={p.onPrevPage} disabled={p.currentPage <= 1}>
         <NavigateBeforeOutlined sx={{ fontSize: 18 }} />
       </Btn>
-
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mx: 0.5 }}>
         <InputBase
           value={pageInput}
@@ -244,17 +264,15 @@ function Toolbar(p: ToolbarProps) {
           onKeyDown={onKeyDown}
           inputProps={{ 'aria-label': 'Current page', style: { textAlign: 'center' } }}
           sx={{
-            width: 40, height: 28, color: THEME.textPrimary, fontSize: '0.8rem',
-            backgroundColor: THEME.blueHover, borderRadius: 1,
-            border: `1px solid ${THEME.border}`,
+            width: 40, height: 28, color: T.textPrimary, fontSize: '0.8rem',
+            backgroundColor: T.blueHover, borderRadius: 1, border: `1px solid ${T.border}`,
             '& input': { padding: '2px 4px' },
           }}
         />
-        <Typography sx={{ color: THEME.textMuted, fontSize: '0.8rem', whiteSpace: 'nowrap' }}>
+        <Typography sx={{ color: T.textMuted, fontSize: '0.8rem', whiteSpace: 'nowrap' }}>
           / {p.numPages || '—'}
         </Typography>
       </Box>
-
       <Btn title="Next page (↓)" onClick={p.onNextPage} disabled={p.currentPage >= p.numPages}>
         <NavigateNextOutlined sx={{ fontSize: 18 }} />
       </Btn>
@@ -262,42 +280,41 @@ function Toolbar(p: ToolbarProps) {
         <LastPageOutlined sx={{ fontSize: 18 }} />
       </Btn>
 
-      <Divider orientation="vertical" sx={sx.divider} />
+      <Divider orientation="vertical" sx={DIVIDER_SX} />
 
+      {/* Zoom */}
       <Btn title="Zoom out" onClick={p.onZoomOut} disabled={p.scale <= ZOOM_MIN}>
         <ZoomOutOutlined sx={{ fontSize: 18 }} />
       </Btn>
-
       <Select
         value={zoomLabel}
         size="small"
         variant="outlined"
-        renderValue={(v) => <Typography sx={{ fontSize: '0.75rem', color: THEME.textPrimary }}>{v}</Typography>}
+        renderValue={(v) => <Typography sx={{ fontSize: '0.75rem', color: T.textPrimary }}>{v}</Typography>}
         sx={{
-          height: 28, minWidth: 100, color: THEME.textPrimary, fontSize: '0.75rem',
-          backgroundColor: THEME.blueHover, borderRadius: 1,
-          border: `1px solid ${THEME.border}`,
+          height: 28, minWidth: 100, color: T.textPrimary, fontSize: '0.75rem',
+          backgroundColor: T.blueHover, borderRadius: 1, border: `1px solid ${T.border}`,
           '& .MuiOutlinedInput-notchedOutline': { border: 'none' },
-          '& .MuiSelect-icon': { color: THEME.textMuted },
+          '& .MuiSelect-icon': { color: T.textMuted },
         }}
         inputProps={{ 'aria-label': 'Zoom level' }}
-        MenuProps={{ PaperProps: { sx: { backgroundColor: '#FFFFFF', color: THEME.textPrimary, boxShadow: '0 4px 16px rgba(21,101,192,0.12)' } } }}
+        MenuProps={{ PaperProps: { sx: { backgroundColor: '#FFFFFF', color: T.textPrimary, boxShadow: `0 4px 16px ${T.blueActive}` } } }}
       >
         {ZOOM_OPTIONS.map((opt) => (
           <MenuItem key={opt.label} value={opt.label}
             onClick={() => p.onZoomSelect(opt.value, opt.preset)}
-            sx={{ fontSize: '0.8rem', color: THEME.textPrimary, '&:hover': { backgroundColor: THEME.blueHover } }}>
+            sx={{ fontSize: '0.8rem', color: T.textPrimary, '&:hover': { backgroundColor: T.blueHover } }}>
             {opt.label}
           </MenuItem>
         ))}
       </Select>
-
       <Btn title="Zoom in" onClick={p.onZoomIn} disabled={p.scale >= ZOOM_MAX}>
         <ZoomInOutlined sx={{ fontSize: 18 }} />
       </Btn>
 
-      <Divider orientation="vertical" sx={sx.divider} />
+      <Divider orientation="vertical" sx={DIVIDER_SX} />
 
+      {/* Rotate */}
       <Btn title="Rotate left"  onClick={p.onRotateLeft}>
         <RotateLeftOutlined sx={{ fontSize: 18 }} />
       </Btn>
@@ -305,13 +322,13 @@ function Toolbar(p: ToolbarProps) {
         <RotateRightOutlined sx={{ fontSize: 18 }} />
       </Btn>
 
-      <Divider orientation="vertical" sx={sx.divider} />
+      <Divider orientation="vertical" sx={DIVIDER_SX} />
 
+      {/* View modes */}
       <Btn title="Text selection mode" onClick={p.onSelectToggle} active={p.selectMode === 'text'}>
         <TextFieldsOutlined sx={{ fontSize: 18 }} />
       </Btn>
-      <Btn
-        title={p.scrollMode === 'continuous' ? 'Switch to single-page view' : 'Switch to continuous scroll'}
+      <Btn title={p.scrollMode === 'continuous' ? 'Switch to single-page' : 'Switch to continuous scroll'}
         onClick={p.onScrollToggle} active={p.scrollMode === 'single'}>
         <ViewDayOutlined sx={{ fontSize: 18 }} />
       </Btn>
@@ -319,8 +336,9 @@ function Toolbar(p: ToolbarProps) {
         <SearchOutlined sx={{ fontSize: 18 }} />
       </Btn>
 
-      <Divider orientation="vertical" sx={sx.divider} />
+      <Divider orientation="vertical" sx={DIVIDER_SX} />
 
+      {/* File operations */}
       <Btn title="Open local file" onClick={p.onOpenFile}>
         <FileOpenOutlined sx={{ fontSize: 18 }} />
       </Btn>
@@ -341,7 +359,7 @@ function Toolbar(p: ToolbarProps) {
 
       {p.fileName && (
         <Typography sx={{
-          ml: 1, color: THEME.textMuted, fontSize: '0.72rem',
+          ml: 1, color: T.textMuted, fontSize: '0.72rem',
           whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 200,
         }} title={p.fileName}>
           {p.fileName}
@@ -351,58 +369,95 @@ function Toolbar(p: ToolbarProps) {
   );
 }
 
+// ─── Lazy thumbnail ───────────────────────────────────────────────────────────
+// Uses IntersectionObserver so only thumbnails in the viewport are rendered.
+// For large documents this avoids loading all page canvases simultaneously.
+
+interface LazyThumbProps {
+  pageNum:     number;
+  currentPage: number;
+  onPageClick: (n: number) => void;
+}
+
+function LazyThumbnail({ pageNum: n, currentPage, onPageClick }: LazyThumbProps) {
+  const ref       = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(false);
+  const active = n === currentPage;
+
+  useEffect(() => {
+    if (!ref.current) return;
+    const io = new IntersectionObserver(
+      ([entry]) => { if (entry.isIntersecting) { setVisible(true); io.disconnect(); } },
+      { rootMargin: '200px' },
+    );
+    io.observe(ref.current);
+    return () => io.disconnect();
+  }, []);
+
+  return (
+    <Box ref={ref} onClick={() => onPageClick(n)} sx={{
+      display: 'flex', flexDirection: 'column', alignItems: 'center',
+      cursor: 'pointer', borderRadius: 1, p: 0.5,
+      border: active ? `2px solid ${T.blue}` : '2px solid transparent',
+      backgroundColor: active ? T.blueActive : 'transparent',
+      '&:hover': { backgroundColor: T.blueHover },
+    }}>
+      <Paper elevation={active ? 4 : 2} sx={{ overflow: 'hidden', mb: 0.5, lineHeight: 0 }}>
+        {visible ? (
+          <Page
+            pageNumber={n}
+            width={THUMB_W}
+            renderTextLayer={false}
+            renderAnnotationLayer={false}
+            loading={<Skeleton variant="rectangular" width={THUMB_W} height={Math.round(THUMB_W * 1.414)} />}
+          />
+        ) : (
+          <Skeleton variant="rectangular" width={THUMB_W} height={Math.round(THUMB_W * 1.414)} />
+        )}
+      </Paper>
+      <Typography variant="caption" sx={{
+        color: active ? T.blue : T.textMuted,
+        fontSize: '0.65rem', fontWeight: active ? 700 : 400,
+      }}>
+        {n}
+      </Typography>
+    </Box>
+  );
+}
+
+// ─── Thumbnail sidebar ────────────────────────────────────────────────────────
+
 function ThumbnailSidebar({ numPages, currentPage, onPageClick }: {
   numPages: number; currentPage: number; onPageClick: (n: number) => void;
 }) {
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, p: 1 }}>
-      {Array.from({ length: numPages }, (_, i) => {
-        const n      = i + 1;
-        const active = n === currentPage;
-        return (
-          <Box key={n} onClick={() => onPageClick(n)} sx={{
-            display: 'flex', flexDirection: 'column', alignItems: 'center',
-            cursor: 'pointer', borderRadius: 1, p: 0.5,
-            border: active ? `2px solid ${THEME.blue}` : '2px solid transparent',
-            backgroundColor: active ? THEME.blueActive : 'transparent',
-            '&:hover': { backgroundColor: THEME.blueHover },
-          }}>
-            <Paper elevation={active ? 4 : 2} sx={{ overflow: 'hidden', mb: 0.5, lineHeight: 0 }}>
-              <Page
-                pageNumber={n}
-                width={THUMB_WIDTH}
-                renderTextLayer={false}
-                renderAnnotationLayer={false}
-                loading={<Skeleton variant="rectangular" width={THUMB_WIDTH} height={Math.round(THUMB_WIDTH * 1.414)} />}
-              />
-            </Paper>
-            <Typography variant="caption" sx={{
-              color: active ? THEME.blue : THEME.textMuted,
-              fontSize: '0.65rem', fontWeight: active ? 700 : 400,
-            }}>
-              {n}
-            </Typography>
-          </Box>
-        );
-      })}
+      {Array.from({ length: numPages }, (_, i) => (
+        <LazyThumbnail key={i + 1} pageNum={i + 1} currentPage={currentPage} onPageClick={onPageClick} />
+      ))}
     </Box>
   );
 }
 
+// ─── Attachments sidebar ──────────────────────────────────────────────────────
+
 function AttachmentsSidebar({ attachments }: { attachments: PdfAttachment[] }) {
   const download = (att: PdfAttachment) => {
-    const blob = new Blob([att.content.buffer as ArrayBuffer], { type: att.mimeType || 'application/octet-stream' });
+    const blob = new Blob([att.content.buffer as ArrayBuffer], { type: att.mimeType });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
-    a.href = url; a.download = att.name; a.click();
+    a.href = url; a.download = att.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
   if (attachments.length === 0)
     return (
       <Box sx={{ p: 2, textAlign: 'center' }}>
-        <AttachFileOutlined sx={{ fontSize: 32, color: THEME.scrollThumb, mb: 1 }} />
-        <Typography variant="caption" color={THEME.textMuted}>No attachments</Typography>
+        <AttachFileOutlined sx={{ fontSize: 32, color: T.scrollThumb, mb: 1 }} />
+        <Typography variant="caption" color={T.textMuted}>No attachments</Typography>
       </Box>
     );
 
@@ -410,18 +465,20 @@ function AttachmentsSidebar({ attachments }: { attachments: PdfAttachment[] }) {
     <List dense disablePadding>
       {attachments.map((att) => (
         <ListItemButton key={att.name} onClick={() => download(att)}
-          sx={{ py: 0.75, '&:hover': { backgroundColor: THEME.blueHover } }}>
-          <DescriptionOutlined sx={{ fontSize: 16, color: THEME.blue, mr: 1, flexShrink: 0 }} />
+          sx={{ py: 0.75, '&:hover': { backgroundColor: T.blueHover } }}>
+          <DescriptionOutlined sx={{ fontSize: 16, color: T.blue, mr: 1, flexShrink: 0 }} />
           <ListItemText
-            primary={<Typography variant="caption" sx={{ color: THEME.textPrimary, wordBreak: 'break-word' }}>{att.name}</Typography>}
-            secondary={<Typography variant="caption" sx={{ color: THEME.textMuted, fontSize: '0.65rem' }}>{formatBytes(att.content.byteLength)}</Typography>}
+            primary={<Typography variant="caption" sx={{ color: T.textPrimary, wordBreak: 'break-word' }}>{att.name}</Typography>}
+            secondary={<Typography variant="caption" sx={{ color: T.textMuted, fontSize: '0.65rem' }}>{formatBytes(att.content.byteLength)}</Typography>}
           />
-          <CloudDownloadOutlined sx={{ fontSize: 14, color: THEME.scrollThumb, ml: 1 }} />
+          <CloudDownloadOutlined sx={{ fontSize: 14, color: T.scrollThumb, ml: 1 }} />
         </ListItemButton>
       ))}
     </List>
   );
 }
+
+// ─── Search panel ─────────────────────────────────────────────────────────────
 
 interface SearchPanelProps {
   query:         string;
@@ -438,41 +495,36 @@ function SearchPanel({ query, matchPages, matchIdx, searching, onQueryChange, on
     <Paper elevation={0} sx={{
       position: 'absolute', top: 8, right: 8, zIndex: 10,
       display: 'flex', alignItems: 'center', gap: 0.5,
-      px: 1.25, py: 0.75, borderRadius: 2,
-      backgroundColor: '#FFFFFF',
-      border: `1px solid ${THEME.border}`,
-      boxShadow: '0 4px 20px rgba(21,101,192,0.14)',
+      px: 1.25, py: 0.75, borderRadius: 2, backgroundColor: '#FFFFFF',
+      border: `1px solid ${T.border}`, boxShadow: `0 4px 20px ${T.blueActive}`,
     }}>
-      <SearchOutlined sx={{ fontSize: 16, color: THEME.blue }} />
-      <InputBase
-        autoFocus
-        placeholder="Search…"
-        value={query}
+      <SearchOutlined sx={{ fontSize: 16, color: T.blue }} />
+      <InputBase autoFocus placeholder="Search…" value={query}
         onChange={(e) => onQueryChange(e.target.value)}
         inputProps={{ 'aria-label': 'Search document text' }}
-        sx={{ color: THEME.textPrimary, fontSize: '0.8rem', width: 180, '& input': { padding: '2px 4px' } }}
+        sx={{ color: T.textPrimary, fontSize: '0.8rem', width: 180, '& input': { padding: '2px 4px' } }}
       />
-      {searching && <CircularProgress size={14} sx={{ color: THEME.blue }} />}
+      {searching && <CircularProgress size={14} sx={{ color: T.blue }} />}
       {!searching && query && (
-        <Typography sx={{ fontSize: '0.72rem', color: THEME.textMuted, whiteSpace: 'nowrap', minWidth: 50 }}>
+        <Typography sx={{ fontSize: '0.72rem', color: T.textMuted, whiteSpace: 'nowrap', minWidth: 50 }}>
           {matchPages.length === 0 ? 'No results' : `${matchIdx + 1}/${matchPages.length} pages`}
         </Typography>
       )}
       <Tooltip title="Previous match"><span>
         <IconButton size="small" onClick={onPrev} disabled={matchPages.length === 0}
-          sx={{ color: THEME.textIcon, p: '2px', '&:hover': { color: THEME.blue } }}>
+          sx={{ color: T.textIcon, p: '2px', '&:hover': { color: T.blue } }}>
           <NavigateBeforeOutlined sx={{ fontSize: 16 }} />
         </IconButton>
       </span></Tooltip>
       <Tooltip title="Next match"><span>
         <IconButton size="small" onClick={onNext} disabled={matchPages.length === 0}
-          sx={{ color: THEME.textIcon, p: '2px', '&:hover': { color: THEME.blue } }}>
+          sx={{ color: T.textIcon, p: '2px', '&:hover': { color: T.blue } }}>
           <NavigateNextOutlined sx={{ fontSize: 16 }} />
         </IconButton>
       </span></Tooltip>
       <Tooltip title="Close search"><span>
         <IconButton size="small" onClick={onClose}
-          sx={{ color: THEME.textIcon, p: '2px', '&:hover': { color: THEME.blue } }}>
+          sx={{ color: T.textIcon, p: '2px', '&:hover': { color: T.blue } }}>
           <CloseOutlined sx={{ fontSize: 16 }} />
         </IconButton>
       </span></Tooltip>
@@ -480,18 +532,20 @@ function SearchPanel({ query, matchPages, matchIdx, searching, onQueryChange, on
   );
 }
 
-function PropertiesDialog({ open, props, onClose }: {
-  open: boolean; props: PdfProperties | null; onClose: () => void;
+// ─── Properties dialog ────────────────────────────────────────────────────────
+
+function PropertiesDialog({ open, info, onClose }: {
+  open: boolean; info: PdfProperties | null; onClose: () => void;
 }) {
-  const rows = props ? [
-    ['Title',             props.title    || '—'],
-    ['Author',            props.author   || '—'],
-    ['Subject',           props.subject  || '—'],
-    ['Creator',           props.creator  || '—'],
-    ['Producer',          props.producer || '—'],
-    ['Creation Date',     formatDate(props.created)],
-    ['Modification Date', formatDate(props.modified)],
-    ['Pages',             String(props.pages)],
+  const rows = info ? [
+    ['Title',             info.title    || '—'],
+    ['Author',            info.author   || '—'],
+    ['Subject',           info.subject  || '—'],
+    ['Creator',           info.creator  || '—'],
+    ['Producer',          info.producer || '—'],
+    ['Creation Date',     formatDate(info.created)],
+    ['Modification Date', formatDate(info.modified)],
+    ['Pages',             String(info.pages)],
   ] : [];
 
   return (
@@ -521,7 +575,7 @@ function PropertiesDialog({ open, props, onClose }: {
   );
 }
 
-// ─── Main Component ───────────────────────────────────────────────────────────
+// ─── Main component ───────────────────────────────────────────────────────────
 
 export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', onDocumentLoad }: PdfViewerProps) {
   const [numPages,       setNumPages]       = useState(0);
@@ -554,23 +608,29 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
   const viewerRef    = useRef<HTMLDivElement>(null);
   const pageRefs     = useRef<(HTMLDivElement | null)[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragCountRef = useRef(0); // tracks nested dragenter/dragleave to prevent flicker
 
   const displayFile = localFileUrl || fileUrl;
   const displayName = localFileName || fileName;
 
-  // ── Zoom ─────────────────────────────────────────────────────────────────
+  // ── Pages array (memoized) ────────────────────────────────────────────────
+
+  const pages = useMemo(() => Array.from({ length: numPages }, (_, i) => i + 1), [numPages]);
+
+  // ── Zoom ──────────────────────────────────────────────────────────────────
 
   const computeFitScale = useCallback((width: number, height: number) => {
     if (!viewerRef.current || width <= 0 || height <= 0) return;
-    const cw = viewerRef.current.clientWidth  - 48;
-    const ch = viewerRef.current.clientHeight - 48;
+    const cw = viewerRef.current.clientWidth  - VIEWER_PADDING;
+    const ch = viewerRef.current.clientHeight - VIEWER_PADDING;
     if (cw <= 0 || ch <= 0) return;
     if (zoomPreset === 'page-fit')
       setScale(Math.max(Math.min(cw / width, ch / height), ZOOM_MIN));
-    if (zoomPreset === 'page-width')
+    else if (zoomPreset === 'page-width')
       setScale(Math.max(cw / width, ZOOM_MIN));
   }, [zoomPreset]);
 
+  // Debounced ResizeObserver to recompute auto-zoom without oscillation.
   useEffect(() => {
     if (!viewerRef.current || (zoomPreset !== 'page-fit' && zoomPreset !== 'page-width')) return;
     if (!origPageWidth || !origPageHeight) return;
@@ -610,42 +670,44 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
     }).catch(() => {});
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (pdf as any).getAttachments().then((atts: Record<string, { content: Uint8Array; filename: string }> | null) => {
-      if (!atts) return;
-      setAttachments(Object.values(atts).map((a) => ({
-        name:     a.filename || 'attachment',
-        content:  a.content,
-        mimeType: 'application/octet-stream',
-      })));
-    }).catch(() => {});
+    (pdf as any).getAttachments()
+      .then((atts: Record<string, { content: Uint8Array; filename: string }> | null) => {
+        if (!atts) return;
+        setAttachments(Object.values(atts).map((a) => ({
+          name:     a.filename || 'attachment',
+          content:  a.content,
+          mimeType: a.filename?.endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream',
+        })));
+      })
+      .catch(() => {});
   }, [onDocumentLoad]);
 
   const handlePageLoadSuccess = useCallback((page: { originalWidth: number; originalHeight: number }) => {
-    if (origPageWidth) return;
+    if (origPageWidth) return; // capture first-page dimensions only
     setOrigPageWidth(page.originalWidth);
     setOrigPageHeight(page.originalHeight);
-    if (zoomPreset === 'page-fit' || zoomPreset === 'page-width') {
+    if (zoomPreset === 'page-fit' || zoomPreset === 'page-width')
       computeFitScale(page.originalWidth, page.originalHeight);
-    } else {
+    else
       setScale(1.0);
-    }
   }, [origPageWidth, zoomPreset, computeFitScale]);
 
+  // Reset all state when fileUrl changes.
   useEffect(() => {
-    setNumPages(0); setCurrentPage(1);
+    setNumPages(0);      setCurrentPage(1);
     setOrigPageWidth(0); setOrigPageHeight(0);
-    setMatchPages([]); setSearchQuery('');
-    setAttachments([]); setPdfProperties(null);
-    setLoadError(null); setLocalFileUrl(null); setLocalFileName('');
+    setMatchPages([]);   setSearchQuery('');
+    setAttachments([]);  setPdfProperties(null);
+    setLoadError(null);  setLocalFileUrl(null); setLocalFileName('');
   }, [fileUrl]);
 
+  // Cleanup local blob URL on unmount.
   useEffect(() => () => { if (localFileUrl) URL.revokeObjectURL(localFileUrl); }, [localFileUrl]);
 
   // ── Navigation ────────────────────────────────────────────────────────────
 
   const scrollToPage = useCallback((n: number) => {
-    const el = pageRefs.current[n - 1];
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    pageRefs.current[n - 1]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }, []);
 
   const goToPage = useCallback((n: number) => {
@@ -654,6 +716,7 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
     if (scrollMode === 'continuous') scrollToPage(clamped);
   }, [numPages, scrollMode, scrollToPage]);
 
+  // IntersectionObserver to track visible page in continuous mode.
   useEffect(() => {
     if (scrollMode !== 'continuous' || !viewerRef.current) return;
     const observer = new IntersectionObserver(
@@ -673,8 +736,8 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
 
   // ── Zoom actions ──────────────────────────────────────────────────────────
 
-  const handleZoomIn     = () => { setZoomPreset('custom'); setScale((s) => Math.min(s + ZOOM_STEP, ZOOM_MAX)); };
-  const handleZoomOut    = () => { setZoomPreset('custom'); setScale((s) => Math.max(s - ZOOM_STEP, ZOOM_MIN)); };
+  const handleZoomIn  = () => { setZoomPreset('custom'); setScale((s) => Math.min(s + ZOOM_STEP, ZOOM_MAX)); };
+  const handleZoomOut = () => { setZoomPreset('custom'); setScale((s) => Math.max(s - ZOOM_STEP, ZOOM_MIN)); };
   const handleZoomSelect = (value: number | null, preset: ZoomPreset) => {
     setZoomPreset(preset);
     if (value !== null) setScale(value);
@@ -698,11 +761,12 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
     else document.exitFullscreen().catch(() => {});
   };
 
-  // ── Keyboard ──────────────────────────────────────────────────────────────
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────
 
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (numPages === 0) return; // no document loaded
       if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); goToPage(currentPage + 1); }
       if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')   { e.preventDefault(); goToPage(currentPage - 1); }
       if (e.key === 'Home')  { e.preventDefault(); goToPage(1); }
@@ -713,14 +777,16 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
     return () => window.removeEventListener('keydown', onKey);
   }, [currentPage, numPages, goToPage]);
 
-  // ── Text search ───────────────────────────────────────────────────────────
+  // ── Text search with debounce ─────────────────────────────────────────────
 
   useEffect(() => {
     if (!pdfDoc || !searchQuery.trim()) { setMatchPages([]); setMatchIdx(0); return; }
     const query = searchQuery.trim().toLowerCase();
     let cancelled = false;
-    setIsSearching(true);
-    (async () => {
+    let timerId: ReturnType<typeof setTimeout>;
+
+    timerId = setTimeout(async () => {
+      setIsSearching(true);
       const hits: number[] = [];
       for (let i = 1; i <= pdfDoc.numPages; i++) {
         if (cancelled) return;
@@ -731,15 +797,17 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
         if (text.includes(query)) hits.push(i);
       }
       if (!cancelled) { setMatchPages(hits); setMatchIdx(0); setIsSearching(false); }
-    })();
-    return () => { cancelled = true; };
+    }, SEARCH_DEBOUNCE_MS);
+
+    return () => { cancelled = true; clearTimeout(timerId); };
   }, [pdfDoc, searchQuery]);
 
+  // Navigate to matching page when index changes.
   useEffect(() => {
     if (matchPages.length > 0) goToPage(matchPages[matchIdx]);
   }, [matchIdx, matchPages, goToPage]);
 
-  // ── Local file / drag-and-drop ────────────────────────────────────────────
+  // ── Drag-and-drop (flicker-free via counter) ──────────────────────────────
 
   const applyLocalFile = (file: File) => {
     if (file.type !== 'application/pdf') return;
@@ -748,15 +816,20 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
     setLocalFileName(file.name);
   };
 
-  const handleDragOver  = (e: DragEvent) => { e.preventDefault(); setIsDragOver(true); };
-  const handleDragLeave = (e: DragEvent) => { e.preventDefault(); setIsDragOver(false); };
+  const handleDragEnter = (e: DragEvent) => { e.preventDefault(); dragCountRef.current++; setIsDragOver(true); };
+  const handleDragLeave = (e: DragEvent) => {
+    e.preventDefault();
+    dragCountRef.current--;
+    if (dragCountRef.current <= 0) { dragCountRef.current = 0; setIsDragOver(false); }
+  };
   const handleDrop = (e: DragEvent) => {
-    e.preventDefault(); setIsDragOver(false);
+    e.preventDefault(); dragCountRef.current = 0; setIsDragOver(false);
     const file = e.dataTransfer.files[0];
     if (file) applyLocalFile(file);
   };
+  const handleDragOver = (e: DragEvent) => e.preventDefault();
 
-  // ── Download & print ──────────────────────────────────────────────────────
+  // ── Download ──────────────────────────────────────────────────────────────
 
   const handleDownload = async () => {
     if (!displayFile) return;
@@ -765,12 +838,16 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
       const blob = await res.blob();
       const url  = URL.createObjectURL(blob);
       const a    = Object.assign(document.createElement('a'), { href: url, download: displayName });
+      document.body.appendChild(a);
       a.click();
+      document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch {
       window.open(displayFile, '_blank', 'noopener,noreferrer');
     }
   };
+
+  // ── Print ─────────────────────────────────────────────────────────────────
 
   const handlePrint = () => {
     if (!displayFile) return;
@@ -782,8 +859,10 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
       setTimeout(() => {
         iframe.contentWindow?.focus();
         iframe.contentWindow?.print();
-        setTimeout(() => document.body.removeChild(iframe), 2000);
-      }, 300);
+        setTimeout(() => {
+          if (document.body.contains(iframe)) document.body.removeChild(iframe);
+        }, 3000);
+      }, 500);
     };
   };
 
@@ -794,7 +873,7 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
     else { setSidebarOpen(true); setSidebarTab(tab); }
   };
 
-  // ── Text renderer (search highlighting) ──────────────────────────────────
+  // ── Custom text renderer (search highlighting) ────────────────────────────
 
   const customTextRenderer = useCallback(({ str }: { str: string }): string =>
     highlightText(str, searchQuery),
@@ -805,24 +884,22 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
   if (!displayFile) return (
     <Box sx={{
       display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-      height: '100%', gap: 2, backgroundColor: THEME.viewerBg, color: THEME.textMuted,
+      height: '100%', gap: 2, backgroundColor: T.viewerBg, color: T.textMuted,
     }}>
-      <PictureAsPdfOutlined sx={{ fontSize: 64, color: THEME.blue, opacity: 0.25 }} />
-      <Typography variant="body2" sx={{ color: THEME.textPrimary, fontWeight: 500 }}>
+      <PictureAsPdfOutlined sx={{ fontSize: 64, color: T.blue, opacity: 0.25 }} />
+      <Typography variant="body2" sx={{ color: T.textPrimary, fontWeight: 500 }}>
         Select a document to view it.
       </Typography>
-      <Typography variant="caption" sx={{ color: THEME.textMuted }}>
+      <Typography variant="caption" sx={{ color: T.textMuted }}>
         Or drag and drop a PDF file here to open it locally.
       </Typography>
     </Box>
   );
 
-  const pages = Array.from({ length: numPages }, (_, i) => i + 1);
-
   return (
     <Box ref={rootRef} sx={{
       display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden',
-      backgroundColor: THEME.toolbarBg, userSelect: selectMode === 'hand' ? 'none' : 'text',
+      backgroundColor: T.toolbarBg, userSelect: selectMode === 'hand' ? 'none' : 'text',
     }}>
       <input
         ref={fileInputRef} type="file" accept="application/pdf" style={{ display: 'none' }}
@@ -868,12 +945,12 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
         '.react-pdf__Outline li': { margin: '1px 0' },
         '.react-pdf__Outline a': {
           display: 'block', padding: '4px 8px', borderRadius: '6px',
-          color: '#1565C0', fontSize: '0.78rem', fontWeight: 500,
-          textDecoration: 'none', lineHeight: 1.4, transition: 'background 0.15s, color 0.15s',
-          wordBreak: 'break-word',
+          color: T.blue, fontSize: '0.78rem', fontWeight: 500,
+          textDecoration: 'none', lineHeight: 1.4,
+          transition: 'background 0.15s, color 0.15s', wordBreak: 'break-word',
         },
-        '.react-pdf__Outline a:hover': { backgroundColor: 'rgba(21,101,192,0.08)', color: '#0D47A1' },
-        '.react-pdf__Outline a:focus-visible': { outline: '2px solid #1565C0', outlineOffset: '1px' },
+        '.react-pdf__Outline a:hover': { backgroundColor: T.blueHover, color: T.blueDark },
+        '.react-pdf__Outline a:focus-visible': { outline: `2px solid ${T.blue}`, outlineOffset: '1px' },
       }} />
 
       <Box sx={{ flex: 1, display: 'flex', overflow: 'hidden', position: 'relative', minHeight: 0 }}>
@@ -884,38 +961,35 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
           className="nrp-document-root"
           loading={
             <Box sx={{ display: 'flex', flex: 1, alignItems: 'center', justifyContent: 'center', width: '100%' }}>
-              <CircularProgress sx={{ color: THEME.blue }} />
+              <CircularProgress sx={{ color: T.blue }} />
             </Box>
           }
           error={
             loadError ? (
               <Box sx={{
                 display: 'flex', flexDirection: 'column', alignItems: 'center',
-                justifyContent: 'center', flex: 1, gap: 2, p: 4, color: THEME.textMuted, width: '100%',
+                justifyContent: 'center', flex: 1, gap: 2, p: 4, width: '100%',
               }}>
                 <WarningAmberOutlined sx={{ fontSize: 40, color: '#EF5350' }} />
-                <Typography variant="body2" textAlign="center" sx={{ color: THEME.textPrimary }}>{loadError}</Typography>
+                <Typography variant="body2" textAlign="center" sx={{ color: T.textPrimary }}>{loadError}</Typography>
               </Box>
             ) : undefined
           }
         >
+          {/* Sidebar */}
           {sidebarOpen && (
             <Box sx={{
-              width: SIDEBAR_WIDTH, flexShrink: 0,
-              borderRight: `1px solid ${THEME.border}`, backgroundColor: THEME.sidebarBg,
+              width: SIDEBAR_W, flexShrink: 0,
+              borderRight: `1px solid ${T.border}`, backgroundColor: T.sidebarBg,
               display: 'flex', flexDirection: 'column', overflow: 'hidden',
             }}>
-              <Tabs
-                value={sidebarTab}
-                onChange={(_, v) => setSidebarTab(v)}
-                sx={{
-                  minHeight: 36, backgroundColor: THEME.sidebarTabBg, flexShrink: 0,
-                  borderBottom: `1px solid ${THEME.border}`,
-                  '& .MuiTab-root': { color: THEME.textMuted, minHeight: 36, py: 0.5, fontSize: '0.7rem' },
-                  '& .Mui-selected': { color: THEME.blue, fontWeight: 700 },
-                  '& .MuiTabs-indicator': { backgroundColor: THEME.blue, height: 3, borderRadius: '3px 3px 0 0' },
-                }}
-              >
+              <Tabs value={sidebarTab} onChange={(_, v) => setSidebarTab(v)} sx={{
+                minHeight: 36, backgroundColor: T.sidebarTabBg, flexShrink: 0,
+                borderBottom: `1px solid ${T.border}`,
+                '& .MuiTab-root': { color: T.textMuted, minHeight: 36, py: 0.5, fontSize: '0.7rem' },
+                '& .Mui-selected': { color: T.blue, fontWeight: 700 },
+                '& .MuiTabs-indicator': { backgroundColor: T.blue, height: 3, borderRadius: '3px 3px 0 0' },
+              }}>
                 <Tab value="thumbnails"  label="Pages"       icon={<ViewStreamOutlined sx={{ fontSize: 14 }} />} iconPosition="start" />
                 <Tab value="outline"     label="Outline"     icon={<BookmarkOutlined   sx={{ fontSize: 14 }} />} iconPosition="start" />
                 <Tab value="attachments" label="Attachments" icon={<AttachFileOutlined sx={{ fontSize: 14 }} />} iconPosition="start" />
@@ -923,7 +997,7 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
               <Box sx={{
                 flex: 1, overflow: 'auto',
                 '&::-webkit-scrollbar': { width: 4 },
-                '&::-webkit-scrollbar-thumb': { backgroundColor: THEME.scrollThumb, borderRadius: 2 },
+                '&::-webkit-scrollbar-thumb': { backgroundColor: T.scrollThumb, borderRadius: 2 },
               }}>
                 {sidebarTab === 'thumbnails' && numPages > 0 && (
                   <ThumbnailSidebar numPages={numPages} currentPage={currentPage} onPageClick={goToPage} />
@@ -940,28 +1014,29 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
             </Box>
           )}
 
+          {/* Main page viewer */}
           <Box
             ref={viewerRef}
+            onDragEnter={handleDragEnter}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
             sx={{
-              flex: 1, minHeight: 0,
-              overflowX: 'hidden', overflowY: 'auto',
+              flex: 1, minHeight: 0, overflowX: 'hidden', overflowY: 'auto',
               position: 'relative',
-              backgroundColor: isDragOver ? THEME.blueActive : THEME.viewerBg,
-              outline: isDragOver ? `3px dashed ${THEME.blue}` : 'none',
+              backgroundColor: isDragOver ? T.blueActive : T.viewerBg,
+              outline: isDragOver ? `3px dashed ${T.blue}` : 'none',
               cursor: selectMode === 'hand' ? 'grab' : 'text',
               '&::-webkit-scrollbar':       { width: 8 },
-              '&::-webkit-scrollbar-thumb': { backgroundColor: THEME.scrollThumb, borderRadius: 4 },
-              '&::-webkit-scrollbar-track': { backgroundColor: THEME.scrollTrack },
+              '&::-webkit-scrollbar-thumb': { backgroundColor: T.scrollThumb, borderRadius: 4 },
+              '&::-webkit-scrollbar-track': { backgroundColor: T.scrollTrack },
             }}
           >
             {isDragOver && (
               <Box sx={{
                 position: 'absolute', inset: 0, zIndex: 5, display: 'flex',
                 alignItems: 'center', justifyContent: 'center', flexDirection: 'column',
-                pointerEvents: 'none', gap: 1, color: THEME.blue,
+                pointerEvents: 'none', gap: 1, color: T.blue,
               }}>
                 <FileOpenOutlined sx={{ fontSize: 48 }} />
                 <Typography variant="body1" fontWeight={600}>Drop PDF to open</Typography>
@@ -970,10 +1045,8 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
 
             {searchOpen && (
               <SearchPanel
-                query={searchQuery}
-                matchPages={matchPages}
-                matchIdx={matchIdx}
-                searching={isSearching}
+                query={searchQuery} matchPages={matchPages}
+                matchIdx={matchIdx} searching={isSearching}
                 onQueryChange={setSearchQuery}
                 onPrev={() => setMatchIdx((i) => (i - 1 + matchPages.length) % matchPages.length)}
                 onNext={() => setMatchIdx((i) => (i + 1) % matchPages.length)}
@@ -1002,7 +1075,7 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
                         onLoadSuccess={n === 1 ? handlePageLoadSuccess : undefined}
                         loading={
                           <Skeleton variant="rectangular"
-                            width={Math.round((origPageWidth || 595) * scale)}
+                            width={Math.round((origPageWidth  || 595) * scale)}
                             height={Math.round((origPageHeight || 842) * scale)}
                           />
                         }
@@ -1023,7 +1096,7 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
                         onLoadSuccess={handlePageLoadSuccess}
                         loading={
                           <Skeleton variant="rectangular"
-                            width={Math.round((origPageWidth || 595) * scale)}
+                            width={Math.round((origPageWidth  || 595) * scale)}
                             height={Math.round((origPageHeight || 842) * scale)}
                           />
                         }
@@ -1038,11 +1111,7 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
         </Document>
       </Box>
 
-      <PropertiesDialog
-        open={propertiesOpen}
-        props={pdfProperties}
-        onClose={() => setPropertiesOpen(false)}
-      />
+      <PropertiesDialog open={propertiesOpen} info={pdfProperties} onClose={() => setPropertiesOpen(false)} />
     </Box>
   );
 }

@@ -1,4 +1,3 @@
-import React from 'react';
 import dynamic from 'next/dynamic';
 import { Box, CircularProgress, Typography } from '@mui/material';
 import { PictureAsPdfOutlined } from '@mui/icons-material';
