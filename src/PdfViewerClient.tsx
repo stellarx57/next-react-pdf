@@ -1,7 +1,15 @@
-import { Document, Page, Outline, pdfjs } from 'react-pdf';
-import type { PDFDocumentProxy } from 'pdfjs-dist';
-import 'react-pdf/dist/Page/AnnotationLayer.css';
-import 'react-pdf/dist/Page/TextLayer.css';
+// ─── pdfjs-dist (self-sustaining — no react-pdf) ─────────────────────────────
+import * as pdfjs from 'pdfjs-dist';
+import type {
+  PDFDocumentProxy,
+} from 'pdfjs-dist';
+import type { TextLayerParameters } from 'pdfjs-dist/types/src/display/text_layer';
+import type { AnnotationLayerParameters } from 'pdfjs-dist/types/src/display/annotation_layer';
+
+// Set default worker only once, client-side. Can be overridden via configurePdfWorker().
+if (typeof window !== 'undefined' && !pdfjs.GlobalWorkerOptions.workerSrc) {
+  pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js';
+}
 
 import React, {
   useCallback, useEffect, useMemo, useRef, useState,
@@ -10,7 +18,7 @@ import React, {
 
 import {
   Alert, Box, CircularProgress, Dialog, DialogContent, DialogTitle,
-  Divider, GlobalStyles, IconButton, InputBase, List, ListItemButton, ListItemText,
+  Divider, IconButton, InputBase, List, ListItemButton, ListItemText,
   MenuItem, Paper, Select, Skeleton, Tab, Tabs, Tooltip, Typography,
 } from '@mui/material';
 import {
@@ -25,6 +33,21 @@ import {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
+/**
+ * Options forwarded directly to `pdfjs.getDocument()`.
+ * Use `httpHeaders` to attach an Authorization header for secured PDF endpoints.
+ */
+export interface PdfDocumentOptions {
+  /** HTTP headers forwarded to every PDF fetch (e.g. `{ Authorization: 'Bearer …' }`). */
+  httpHeaders?: Record<string, string>;
+  /** Send cookies with cross-origin requests. */
+  withCredentials?: boolean;
+  /** Password for password-protected PDFs. */
+  password?: string;
+  /** Any additional options understood by pdfjs `getDocument()`. */
+  [key: string]: unknown;
+}
+
 export interface PdfViewerProps {
   /** URL or blob URL of the PDF to display. Pass `null` for an empty state. */
   fileUrl: string | null;
@@ -32,6 +55,59 @@ export interface PdfViewerProps {
   fileName?: string;
   /** Fired once the PDF document metadata is loaded; receives total page count. */
   onDocumentLoad?: (numPages: number) => void;
+  /** Fired when the current visible page changes. */
+  onPageChange?: (page: number) => void;
+  /** Fired when the PDF fails to load. */
+  onError?: (err: Error) => void;
+  /** Page number to open when a new document loads. Defaults to `1`. */
+  initialPage?: number;
+  /** Initial zoom. A number is treated as a scale factor (1.0 = 100%). Defaults to `'page-fit'`. */
+  defaultZoom?: number | 'page-fit' | 'page-width';
+  /**
+   * pdfjs `getDocument()` options. The most important field is `httpHeaders`
+   * for passing an Authorization header to secured endpoints.
+   *
+   * @example
+   * ```tsx
+   * <PdfViewer
+   *   fileUrl="/api/attachment?fileName=abc.pdf"
+   *   options={{ httpHeaders: { Authorization: `Bearer ${token}` } }}
+   * />
+   * ```
+   */
+  options?: PdfDocumentOptions;
+  /**
+   * Custom token resolver called when `options.httpHeaders` is not set.
+   * Return the raw JWT (without the scheme prefix); the viewer prepends `'Bearer '`.
+   * Return `null` or `undefined` to skip auth injection.
+   *
+   * @example
+   * ```tsx
+   * <PdfViewer
+   *   fileUrl={url}
+   *   tokenResolver={() => sessionStorage.getItem('jwt')}
+   * />
+   * ```
+   */
+  tokenResolver?: () => string | null | undefined;
+  /**
+   * `localStorage` key for the access token.
+   * Used when neither `options` nor `tokenResolver` is provided.
+   * Defaults to `'access_token'`.
+   */
+  tokenKey?: string;
+  /**
+   * `localStorage` key for the token type (e.g. `'Bearer'`).
+   * Used when neither `options` nor `tokenResolver` is provided.
+   * Defaults to `'token_type'`.
+   */
+  tokenTypeKey?: string;
+  /**
+   * Set to `true` to completely disable automatic auth-header injection.
+   * Useful when the PDF URL is public or the token is already embedded in the URL.
+   * Defaults to `false`.
+   */
+  disableAuth?: boolean;
 }
 
 // ─── Internal types ───────────────────────────────────────────────────────────
@@ -102,11 +178,6 @@ const ZOOM_OPTIONS: { label: string; value: number | null; preset: ZoomPreset }[
   { label: '400%',        value: 4.00, preset: 'custom'     },
 ];
 
-// Set default worker URL client-side only, if not already configured.
-if (typeof window !== 'undefined' && !pdfjs.GlobalWorkerOptions.workerSrc) {
-  pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js';
-}
-
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function escHtml(s: string): string {
@@ -142,6 +213,386 @@ function formatBytes(n: number): string {
   if (n < 1024)          return `${n} B`;
   if (n < 1024 * 1024)   return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1048576).toFixed(1)} MB`;
+}
+
+/** Map common file extensions to MIME types for downloaded attachments. */
+const MIME_MAP: Record<string, string> = {
+  pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+  gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', tiff: 'image/tiff',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  doc:  'application/msword',  xls: 'application/vnd.ms-excel',
+  ppt:  'application/vnd.ms-powerpoint', zip: 'application/zip',
+  txt: 'text/plain', xml: 'text/xml', json: 'application/json',
+  mp4: 'video/mp4', mp3: 'audio/mpeg',
+};
+function mimeFromFilename(name: string): string {
+  const ext = name.split('.').pop()?.toLowerCase() ?? '';
+  return MIME_MAP[ext] ?? 'application/octet-stream';
+}
+
+// ─── Minimal IPDFLinkService — handles external links & in-doc navigation ──────
+// Fulfils the interface required by pdfjs-dist AnnotationLayer with a lightweight
+// implementation. Callers can pass an `onGotoPage` callback for in-document jumps.
+class SimpleLinkService {
+  private _page = 1;
+  private _pagesCount = 0;
+  private _onGotoPage: (n: number) => void;
+
+  constructor(options: { pagesCount?: number; onGotoPage?: (n: number) => void } = {}) {
+    this._pagesCount  = options.pagesCount  ?? 0;
+    this._onGotoPage  = options.onGotoPage  ?? (() => {});
+  }
+
+  get pagesCount()           { return this._pagesCount; }
+  get page()                 { return this._page; }
+  set page(v: number)        { this._page = v; }
+  get rotation()             { return 0; }
+  set rotation(_v: number)   { /* no-op */ }
+  get isInPresentationMode() { return false; }
+  get externalLinkEnabled()  { return true; }
+  set externalLinkEnabled(_v: boolean) { /* no-op */ }
+
+  goToDestination(dest: string | unknown[]): Promise<void> {
+    if (typeof dest === 'number') this._onGotoPage(dest as number);
+    return Promise.resolve();
+  }
+  goToPage(val: number | string): void {
+    const n = typeof val === 'string' ? parseInt(val, 10) : val;
+    if (!isNaN(n)) this._onGotoPage(n);
+  }
+  goToXY(pageNumber: number, _x: number, _y: number): void { this._onGotoPage(pageNumber); }
+
+  addLinkAttributes(link: HTMLAnchorElement, url: string, newWindow = true): void {
+    link.href   = url;
+    link.target = newWindow ? '_blank' : '_self';
+    link.rel    = 'noopener noreferrer';
+  }
+  getDestinationHash(_dest: unknown): string { return ''; }
+  getAnchorUrl(_hash: unknown): string { return ''; }
+  setHash(_hash: string): void { /* no-op */ }
+  executeNamedAction(_action: string): void { /* no-op */ }
+  executeSetOCGState(_action: object): void { /* no-op */ }
+}
+
+// ─── Layer CSS (injected at module scope) ──────────────────────────────────────
+// We inject the CSS needed for pdfjs TextLayer and AnnotationLayer as inline
+// JS to keep the package self-contained (no CSS import required by the consumer).
+const LAYER_CSS = `
+.nrp-text-layer {
+  position:absolute; inset:0; overflow:clip; opacity:0.25;
+  line-height:1; text-size-adjust:none; forced-color-adjust:none;
+  transform-origin:0 0; caret-color:CanvasText; z-index:2;
+  pointer-events:none;
+}
+.nrp-text-selectable .nrp-text-layer { pointer-events:auto; cursor:text; }
+.nrp-text-layer span, .nrp-text-layer br {
+  color:transparent; position:absolute; white-space:pre;
+  transform-origin:0% 0%;
+}
+.nrp-text-layer .highlight {
+  margin:-1px; padding:1px; background-color:rgba(180,0,170,1); border-radius:4px;
+}
+.nrp-text-layer .highlight.selected { background-color:rgba(0,100,0,1); }
+.nrp-text-layer ::selection { background:rgba(0,0,255,0.25); }
+.nrp-annot-layer {
+  position:absolute; inset:0; overflow:hidden;
+  pointer-events:none; transform-origin:0 0; z-index:3;
+}
+.nrp-annot-layer section { pointer-events:auto; position:absolute; transform-origin:0 0; }
+.nrp-annot-layer canvas { position:absolute; width:100%; height:100%; }
+.nrp-annot-layer .linkAnnotation > a,
+.nrp-annot-layer .buttonWidgetAnnotation.pushButton > a {
+  position:absolute; font-size:1em; top:0; left:0; width:100%; height:100%;
+}
+.nrp-annot-layer .linkAnnotation > a:hover,
+.nrp-annot-layer .buttonWidgetAnnotation.pushButton > a:hover {
+  opacity:0.2; background:rgb(255,255,0); box-shadow:0px 2px 10px rgb(255,255,0);
+}
+`;
+
+if (typeof document !== 'undefined') {
+  const id = 'nrp-layer-css';
+  if (!document.getElementById(id)) {
+    const style = document.createElement('style');
+    style.id = id;
+    style.textContent = LAYER_CSS;
+    document.head.appendChild(style);
+  }
+}
+
+// ─── PdfPage — renders a single PDF page using pdfjs-dist directly ────────────
+// Replaces react-pdf's <Page> component. Manages canvas, TextLayer, AnnotationLayer.
+
+interface PdfPageProps {
+  /** Loaded PDFDocumentProxy — must be valid and not destroyed. */
+  pdf:                   PDFDocumentProxy;
+  pageNumber:            number;
+  scale:                 number;
+  /** Rotation in degrees (0, 90, 180, 270). */
+  rotation:              number;
+  renderTextLayer:       boolean;
+  renderAnnotationLayer: boolean;
+  /** Called with the first-page dimensions after successful render. */
+  onLoadSuccess?: (dimensions: { originalWidth: number; originalHeight: number }) => void;
+  /** Fallback rendered while page loads. */
+  loading?: React.ReactNode;
+  /** Map (string → HTML) applied to text spans; enables search highlighting. */
+  customTextRenderer?: (str: string) => string;
+  /** Used by AnnotationLayer for internal navigation. */
+  linkService?: SimpleLinkService;
+  /** Extra inline style on the page root. */
+  style?: React.CSSProperties;
+}
+
+function PdfPage({
+  pdf, pageNumber, scale, rotation,
+  renderTextLayer: doText,
+  renderAnnotationLayer: doAnnot,
+  onLoadSuccess, loading, customTextRenderer, linkService, style,
+}: PdfPageProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [loaded, setLoaded]       = useState(false);
+  const [renderErr, setRenderErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    let cancelled = false;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let renderTask: any = null;
+
+    setLoaded(false);
+    setRenderErr(null);
+
+    // Clear previous content
+    container.innerHTML = '';
+
+    const run = async () => {
+      const page         = await pdf.getPage(pageNumber);
+      if (cancelled) return;
+
+      const viewport = page.getViewport({ scale, rotation });
+
+      // ── Canvas ────────────────────────────────────────────────────────────
+      const canvas       = document.createElement('canvas');
+      const ctx          = canvas.getContext('2d');
+      if (!ctx) { setRenderErr('Canvas 2D context unavailable.'); return; }
+
+      const outputScale   = window.devicePixelRatio || 1;
+      canvas.width        = Math.floor(viewport.width  * outputScale);
+      canvas.height       = Math.floor(viewport.height * outputScale);
+      canvas.style.width  = `${viewport.width}px`;
+      canvas.style.height = `${viewport.height}px`;
+      canvas.style.display = 'block';
+      canvas.style.position = 'relative';
+      canvas.style.zIndex   = '1';
+
+      container.style.position = 'relative';
+      container.style.width    = `${viewport.width}px`;
+      container.style.height   = `${viewport.height}px`;
+      container.appendChild(canvas);
+
+      const transform = outputScale !== 1
+        ? [outputScale, 0, 0, outputScale, 0, 0]
+        : undefined;
+
+      renderTask = page.render({ canvas, canvasContext: ctx, viewport, transform } as Parameters<typeof page.render>[0]);
+      await renderTask.promise;
+      if (cancelled) return;
+
+      // ── Text layer ────────────────────────────────────────────────────────
+      if (doText) {
+        const textDiv = document.createElement('div');
+        textDiv.className = 'nrp-text-layer';
+        textDiv.style.width  = `${viewport.width}px`;
+        textDiv.style.height = `${viewport.height}px`;
+        container.appendChild(textDiv);
+
+        const textContent = await page.getTextContent();
+        if (cancelled) return;
+
+        // Apply custom highlight renderer if provided
+        if (customTextRenderer) {
+          textContent.items.forEach((item) => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const it = item as any;
+            if (it.str != null) it.str = customTextRenderer(it.str);
+          });
+        }
+
+        try {
+          const tl = new pdfjs.TextLayer({
+            textContentSource: textContent,
+            container: textDiv,
+            viewport,
+          } as TextLayerParameters);
+          await tl.render();
+        } catch { /* non-critical; omit text layer gracefully */ }
+        if (cancelled) return;
+      }
+
+      // ── Annotation layer ──────────────────────────────────────────────────
+      if (doAnnot) {
+        const annotDiv = document.createElement('div');
+        annotDiv.className = 'nrp-annot-layer';
+        annotDiv.style.width  = `${viewport.width}px`;
+        annotDiv.style.height = `${viewport.height}px`;
+        container.appendChild(annotDiv);
+
+        try {
+          const annotations = await page.getAnnotations({ intent: 'display' });
+          if (cancelled) return;
+
+          const ls = linkService ?? new SimpleLinkService();
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const annLayer = new (pdfjs as any).AnnotationLayer({
+            div:                      annotDiv,
+            accessibilityManager:     null,
+            annotationCanvasMap:      null,
+            annotationEditorUIManager:null,
+            page,
+            viewport:                 viewport.clone({ dontFlip: true }),
+            structTreeLayer:          null,
+            commentManager:           null,
+            linkService:              ls,
+            annotationStorage:        null,
+          });
+          await annLayer.render({
+            viewport: viewport.clone({ dontFlip: true }),
+            div:      annotDiv,
+            annotations,
+            page,
+            linkService:    ls,
+            renderForms:    false,
+          } as AnnotationLayerParameters);
+        } catch { /* non-critical; omit annotation layer gracefully */ }
+        if (cancelled) return;
+      }
+
+      onLoadSuccess?.({ originalWidth: viewport.width / scale, originalHeight: viewport.height / scale });
+      setLoaded(true);
+    };
+
+    run().catch((err) => {
+      if (!cancelled) setRenderErr(err?.message ?? 'Page render error.');
+    });
+
+    return () => {
+      cancelled = true;
+      try { renderTask?.cancel(); } catch { /* ignore */ }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pdf, pageNumber, scale, rotation, doText, doAnnot]);
+
+  const viewport = useMemo(() => {
+    // Derive dimensions without rendering — for skeleton sizing
+    // This is a rough estimate (595 × 842 is A4 at 72 dpi)
+    return { width: 595 * scale, height: 842 * scale };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scale]);
+
+  if (renderErr) return (
+    <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center',
+      width: viewport.width, height: viewport.height, color: '#EF5350' }}>
+      <WarningAmberOutlined sx={{ mr: 0.5, fontSize: 16 }} />
+      <Typography variant="caption">{renderErr}</Typography>
+    </Box>
+  );
+
+  return (
+    <div
+      ref={containerRef}
+      style={{ position: 'relative', display: 'inline-block', lineHeight: 0, ...style }}
+      aria-label={`PDF page ${pageNumber}`}
+    >
+      {!loaded && (loading ?? (
+        <Skeleton variant="rectangular"
+          width={Math.round(viewport.width)}
+          height={Math.round(viewport.height)}
+        />
+      ))}
+    </div>
+  );
+}
+
+// ─── PdfOutline — renders the document's table of contents ───────────────────
+
+interface OutlineItem {
+  title: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  dest:  string | any[] | null;
+  items: OutlineItem[];
+}
+
+function OutlineNode({
+  item, indent, onItemClick,
+}: { item: OutlineItem; indent: number; onItemClick: (dest: OutlineItem['dest']) => void }) {
+  const [open, setOpen] = useState(indent < 2);
+  return (
+    <>
+      <Box
+        component="a"
+        href="#"
+        onClick={(e: React.MouseEvent) => {
+          e.preventDefault();
+          if (item.items.length) setOpen((v) => !v);
+          onItemClick(item.dest);
+        }}
+        sx={{
+          display: 'block', px: `${8 + indent * 12}px`, py: '4px',
+          borderRadius: '6px', color: T.blue, fontSize: '0.78rem', fontWeight: 500,
+          textDecoration: 'none', lineHeight: 1.4, wordBreak: 'break-word',
+          transition: 'background 0.15s, color 0.15s',
+          '&:hover': { backgroundColor: T.blueHover, color: T.blueDark },
+          '&:focus-visible': { outline: `2px solid ${T.blue}`, outlineOffset: '1px' },
+        }}
+      >
+        {item.items.length > 0 && (
+          <span style={{ marginRight: 4, fontSize: '0.65em', opacity: 0.7 }}>
+            {open ? '▾' : '▸'}
+          </span>
+        )}
+        {item.title}
+      </Box>
+      {open && item.items.map((child, i) => (
+        <OutlineNode key={i} item={child} indent={indent + 1} onItemClick={onItemClick} />
+      ))}
+    </>
+  );
+}
+
+interface PdfOutlineProps {
+  pdf:         PDFDocumentProxy | null;
+  onItemClick: (dest: OutlineItem['dest']) => void;
+}
+function PdfOutline({ pdf, onItemClick }: PdfOutlineProps) {
+  const [items, setItems] = useState<OutlineItem[]>([]);
+
+  useEffect(() => {
+    if (!pdf) return;
+    pdf.getOutline()
+      .then((outline) => setItems((outline as OutlineItem[]) ?? []))
+      .catch(() => setItems([]));
+  }, [pdf]);
+
+  if (items.length === 0)
+    return (
+      <Box sx={{ p: 2, textAlign: 'center' }}>
+        <BookmarkBorderOutlined sx={{ fontSize: 32, color: T.scrollThumb, mb: 1 }} />
+        <Typography variant="caption" color={T.textMuted}>No outline</Typography>
+      </Box>
+    );
+
+  return (
+    <Box sx={{ p: 0.5 }}>
+      {items.map((item, i) => (
+        <OutlineNode key={i} item={item} indent={0} onItemClick={onItemClick} />
+      ))}
+    </Box>
+  );
 }
 
 // ─── Shared toolbar button ────────────────────────────────────────────────────
@@ -375,12 +826,13 @@ function Toolbar(p: ToolbarProps) {
 
 interface LazyThumbProps {
   pageNum:     number;
+  pdf:         PDFDocumentProxy;
   currentPage: number;
   onPageClick: (n: number) => void;
 }
 
-function LazyThumbnail({ pageNum: n, currentPage, onPageClick }: LazyThumbProps) {
-  const ref       = useRef<HTMLDivElement>(null);
+function LazyThumbnail({ pageNum: n, pdf, currentPage, onPageClick }: LazyThumbProps) {
+  const ref             = useRef<HTMLDivElement>(null);
   const [visible, setVisible] = useState(false);
   const active = n === currentPage;
 
@@ -404,9 +856,11 @@ function LazyThumbnail({ pageNum: n, currentPage, onPageClick }: LazyThumbProps)
     }}>
       <Paper elevation={active ? 4 : 2} sx={{ overflow: 'hidden', mb: 0.5, lineHeight: 0 }}>
         {visible ? (
-          <Page
+          <PdfPage
+            pdf={pdf}
             pageNumber={n}
-            width={THUMB_W}
+            scale={THUMB_W / 595}
+            rotation={0}
             renderTextLayer={false}
             renderAnnotationLayer={false}
             loading={<Skeleton variant="rectangular" width={THUMB_W} height={Math.round(THUMB_W * 1.414)} />}
@@ -427,13 +881,13 @@ function LazyThumbnail({ pageNum: n, currentPage, onPageClick }: LazyThumbProps)
 
 // ─── Thumbnail sidebar ────────────────────────────────────────────────────────
 
-function ThumbnailSidebar({ numPages, currentPage, onPageClick }: {
-  numPages: number; currentPage: number; onPageClick: (n: number) => void;
+function ThumbnailSidebar({ pdf, numPages, currentPage, onPageClick }: {
+  pdf: PDFDocumentProxy; numPages: number; currentPage: number; onPageClick: (n: number) => void;
 }) {
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, p: 1 }}>
       {Array.from({ length: numPages }, (_, i) => (
-        <LazyThumbnail key={i + 1} pageNum={i + 1} currentPage={currentPage} onPageClick={onPageClick} />
+        <LazyThumbnail key={i + 1} pageNum={i + 1} pdf={pdf} currentPage={currentPage} onPageClick={onPageClick} />
       ))}
     </Box>
   );
@@ -577,11 +1031,16 @@ function PropertiesDialog({ open, info, onClose }: {
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
-export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', onDocumentLoad }: PdfViewerProps) {
+export default function PdfViewerClient({
+  fileUrl, fileName = 'document.pdf', onDocumentLoad,
+  onPageChange, onError, initialPage = 1, defaultZoom = 'page-fit',
+  options, tokenResolver, tokenKey = 'access_token',
+  tokenTypeKey = 'token_type', disableAuth = false,
+}: PdfViewerProps) {
   const [numPages,       setNumPages]       = useState(0);
-  const [currentPage,    setCurrentPage]    = useState(1);
+  const [currentPage,    setCurrentPage]    = useState(initialPage);
   const [scale,          setScale]          = useState(1.0);
-  const [zoomPreset,     setZoomPreset]     = useState<ZoomPreset>('page-fit');
+  const [zoomPreset,     setZoomPreset]     = useState<ZoomPreset>(defaultZoom as ZoomPreset);
   const [rotation,       setRotation]       = useState(0);
   const [scrollMode,     setScrollMode]     = useState<ScrollMode>('continuous');
   const [selectMode,     setSelectMode]     = useState<SelectMode>('text');
@@ -612,6 +1071,25 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
 
   const displayFile = localFileUrl || fileUrl;
   const displayName = localFileName || fileName;
+
+  // ── Auth resolution (options → tokenResolver → localStorage) ─────────────
+
+  const resolvedOptions = useMemo<PdfDocumentOptions>(() => {
+    if (options?.httpHeaders) return options;
+    if (disableAuth) return options ?? {};
+    const rawToken = tokenResolver ? tokenResolver() : null;
+    if (rawToken) return { ...options, httpHeaders: { Authorization: `Bearer ${rawToken}` } };
+    if (typeof window === 'undefined') return options ?? {};
+    const token     = window.localStorage.getItem(tokenKey);
+    const tokenType = window.localStorage.getItem(tokenTypeKey) ?? 'Bearer';
+    if (!token) return options ?? {};
+    return { ...options, httpHeaders: { Authorization: `${tokenType} ${token}` } };
+  }, [options, tokenResolver, disableAuth, tokenKey, tokenTypeKey]);
+
+  // ── LinkService instance for AnnotationLayer navigation ──────────────────
+  const linkServiceRef = useRef<SimpleLinkService>(
+    new SimpleLinkService({ pagesCount: 0, onGotoPage: () => {} }),
+  );
 
   // ── Pages array (memoized) ────────────────────────────────────────────────
 
@@ -644,62 +1122,88 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
     return () => { observer.disconnect(); cancelAnimationFrame(rafId); };
   }, [computeFitScale, origPageWidth, origPageHeight, zoomPreset]);
 
-  // ── Document load ─────────────────────────────────────────────────────────
 
-  const handleDocumentLoadSuccess = useCallback((pdf: PDFDocumentProxy) => {
-    setNumPages(pdf.numPages);
-    setCurrentPage(1);
-    setLoadError(null);
-    setPdfDoc(pdf);
-    onDocumentLoad?.(pdf.numPages);
-    pageRefs.current = new Array(pdf.numPages).fill(null);
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    pdf.getMetadata().then(({ info }: { info: any }) => {
-      const s = (v: unknown) => (v != null ? String(v) : '');
-      setPdfProperties({
-        title:    s(info.Title),
-        author:   s(info.Author),
-        subject:  s(info.Subject),
-        creator:  s(info.Creator),
-        producer: s(info.Producer),
-        created:  s(info.CreationDate),
-        modified: s(info.ModDate),
-        pages:    pdf.numPages,
-      });
-    }).catch(() => {});
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (pdf as any).getAttachments()
-      .then((atts: Record<string, { content: Uint8Array; filename: string }> | null) => {
-        if (!atts) return;
-        setAttachments(Object.values(atts).map((a) => ({
-          name:     a.filename || 'attachment',
-          content:  a.content,
-          mimeType: a.filename?.endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream',
-        })));
-      })
-      .catch(() => {});
-  }, [onDocumentLoad]);
-
-  const handlePageLoadSuccess = useCallback((page: { originalWidth: number; originalHeight: number }) => {
+  const handlePageLoadSuccess = useCallback(({ originalWidth, originalHeight }: { originalWidth: number; originalHeight: number }) => {
     if (origPageWidth) return; // capture first-page dimensions only
-    setOrigPageWidth(page.originalWidth);
-    setOrigPageHeight(page.originalHeight);
+    setOrigPageWidth(originalWidth);
+    setOrigPageHeight(originalHeight);
     if (zoomPreset === 'page-fit' || zoomPreset === 'page-width')
-      computeFitScale(page.originalWidth, page.originalHeight);
+      computeFitScale(originalWidth, originalHeight);
     else
       setScale(1.0);
   }, [origPageWidth, zoomPreset, computeFitScale]);
 
-  // Reset all state when fileUrl changes.
+  // Reset + load PDF whenever the URL or auth options change.
   useEffect(() => {
-    setNumPages(0);      setCurrentPage(1);
+    setNumPages(0);      setCurrentPage(initialPage);
     setOrigPageWidth(0); setOrigPageHeight(0);
     setMatchPages([]);   setSearchQuery('');
     setAttachments([]);  setPdfProperties(null);
-    setLoadError(null);  setLocalFileUrl(null); setLocalFileName('');
-  }, [fileUrl]);
+    setLoadError(null);
+    if (!displayFile) return;
+
+    let cancelled = false;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let loadingTask: any = null;
+
+    const run = async () => {
+      loadingTask = pdfjs.getDocument({ url: displayFile, ...resolvedOptions });
+      const pdf: PDFDocumentProxy = await loadingTask.promise;
+      if (cancelled) { pdf.destroy(); return; }
+      setPdfDoc(pdf);
+      setNumPages(pdf.numPages);
+      setLoadError(null);
+      onDocumentLoad?.(pdf.numPages);
+      pageRefs.current = new Array(pdf.numPages).fill(null);
+      // Update link service with real page count.
+      linkServiceRef.current = new SimpleLinkService({
+        pagesCount: pdf.numPages,
+        onGotoPage: (n) => goToPage(n),
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      pdf.getMetadata().then(({ info }: { info: any }) => {
+        const s = (v: unknown) => (v != null ? String(v) : '');
+        setPdfProperties({
+          title:    s(info.Title),
+          author:   s(info.Author),
+          subject:  s(info.Subject),
+          creator:  s(info.Creator),
+          producer: s(info.Producer),
+          created:  s(info.CreationDate),
+          modified: s(info.ModDate),
+          pages:    pdf.numPages,
+        });
+      }).catch(() => {});
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (pdf as any).getAttachments()
+        .then((atts: Record<string, { content: Uint8Array; filename: string }> | null) => {
+          if (!atts) return;
+          setAttachments(Object.values(atts).map((a) => ({
+            name:     a.filename || 'attachment',
+            content:  a.content,
+            mimeType: mimeFromFilename(a.filename || ''),
+          })));
+        })
+        .catch(() => {});
+    };
+
+    run().catch((err: Error) => {
+      if (!cancelled) {
+        const msg = err?.message || 'Failed to load PDF.';
+        setLoadError(msg);
+        onError?.(err);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      loadingTask?.destroy?.();
+      setPdfDoc(null);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [displayFile, resolvedOptions, initialPage]);
 
   // Cleanup local blob URL on unmount.
   useEffect(() => () => { if (localFileUrl) URL.revokeObjectURL(localFileUrl); }, [localFileUrl]);
@@ -713,8 +1217,9 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
   const goToPage = useCallback((n: number) => {
     const clamped = Math.max(1, Math.min(n, numPages));
     setCurrentPage(clamped);
+    onPageChange?.(clamped);
     if (scrollMode === 'continuous') scrollToPage(clamped);
-  }, [numPages, scrollMode, scrollToPage]);
+  }, [numPages, scrollMode, scrollToPage, onPageChange]);
 
   // IntersectionObserver to track visible page in continuous mode.
   useEffect(() => {
@@ -834,7 +1339,7 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
   const handleDownload = async () => {
     if (!displayFile) return;
     try {
-      const res  = await fetch(displayFile);
+      const res  = await fetch(displayFile, { headers: resolvedOptions?.httpHeaders ?? {} });
       const blob = await res.blob();
       const url  = URL.createObjectURL(blob);
       const a    = Object.assign(document.createElement('a'), { href: url, download: displayName });
@@ -849,21 +1354,40 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
 
   // ── Print ─────────────────────────────────────────────────────────────────
 
-  const handlePrint = () => {
+  const handlePrint = async () => {
     if (!displayFile) return;
-    const iframe = document.createElement('iframe');
-    iframe.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;';
-    iframe.src = displayFile;
-    document.body.appendChild(iframe);
-    iframe.onload = () => {
-      setTimeout(() => {
-        iframe.contentWindow?.focus();
-        iframe.contentWindow?.print();
+    try {
+      const res  = await fetch(displayFile, { headers: resolvedOptions?.httpHeaders ?? {} });
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      const iframe = document.createElement('iframe');
+      iframe.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;';
+      iframe.src = url;
+      document.body.appendChild(iframe);
+      iframe.onload = () => {
         setTimeout(() => {
-          if (document.body.contains(iframe)) document.body.removeChild(iframe);
-        }, 3000);
-      }, 500);
-    };
+          iframe.contentWindow?.focus();
+          iframe.contentWindow?.print();
+          setTimeout(() => {
+            if (document.body.contains(iframe)) document.body.removeChild(iframe);
+            URL.revokeObjectURL(url);
+          }, 3000);
+        }, 500);
+      };
+    } catch {
+      // fallback — no auth
+      const iframe = document.createElement('iframe');
+      iframe.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;';
+      iframe.src = displayFile;
+      document.body.appendChild(iframe);
+      iframe.onload = () => {
+        setTimeout(() => {
+          iframe.contentWindow?.focus();
+          iframe.contentWindow?.print();
+          setTimeout(() => { if (document.body.contains(iframe)) document.body.removeChild(iframe); }, 3000);
+        }, 500);
+      };
+    }
   };
 
   // ── Sidebar ───────────────────────────────────────────────────────────────
@@ -875,7 +1399,7 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
 
   // ── Custom text renderer (search highlighting) ────────────────────────────
 
-  const customTextRenderer = useCallback(({ str }: { str: string }): string =>
+  const customTextRenderer = useCallback((str: string): string =>
     highlightText(str, searchQuery),
   [searchQuery]);
 
@@ -933,182 +1457,145 @@ export default function PdfViewerClient({ fileUrl, fileName = 'document.pdf', on
         onSearchToggle={() => setSearchOpen((v) => !v)}
       />
 
-      <GlobalStyles styles={{
-        '.nrp-document-root': {
-          flex: '1 !important',
-          display: 'flex !important',
-          overflow: 'hidden !important',
-          minHeight: '0 !important',
-        },
-        '.react-pdf__Outline': { margin: 0, padding: 0 },
-        '.react-pdf__Outline ul': { listStyle: 'none', padding: '0 0 0 14px', margin: 0 },
-        '.react-pdf__Outline li': { margin: '1px 0' },
-        '.react-pdf__Outline a': {
-          display: 'block', padding: '4px 8px', borderRadius: '6px',
-          color: T.blue, fontSize: '0.78rem', fontWeight: 500,
-          textDecoration: 'none', lineHeight: 1.4,
-          transition: 'background 0.15s, color 0.15s', wordBreak: 'break-word',
-        },
-        '.react-pdf__Outline a:hover': { backgroundColor: T.blueHover, color: T.blueDark },
-        '.react-pdf__Outline a:focus-visible': { outline: `2px solid ${T.blue}`, outlineOffset: '1px' },
-      }} />
-
       <Box sx={{ flex: 1, display: 'flex', overflow: 'hidden', position: 'relative', minHeight: 0 }}>
-        <Document
-          file={displayFile}
-          onLoadSuccess={handleDocumentLoadSuccess}
-          onLoadError={(err) => setLoadError(err.message || 'Failed to load PDF.')}
-          className="nrp-document-root"
-          loading={
-            <Box sx={{ display: 'flex', flex: 1, alignItems: 'center', justifyContent: 'center', width: '100%' }}>
-              <CircularProgress sx={{ color: T.blue }} />
-            </Box>
-          }
-          error={
-            loadError ? (
-              <Box sx={{
-                display: 'flex', flexDirection: 'column', alignItems: 'center',
-                justifyContent: 'center', flex: 1, gap: 2, p: 4, width: '100%',
-              }}>
-                <WarningAmberOutlined sx={{ fontSize: 40, color: '#EF5350' }} />
-                <Typography variant="body2" textAlign="center" sx={{ color: T.textPrimary }}>{loadError}</Typography>
-              </Box>
-            ) : undefined
-          }
-        >
-          {/* Sidebar */}
-          {sidebarOpen && (
-            <Box sx={{
-              width: SIDEBAR_W, flexShrink: 0,
-              borderRight: `1px solid ${T.border}`, backgroundColor: T.sidebarBg,
-              display: 'flex', flexDirection: 'column', overflow: 'hidden',
+
+        {/* Loading overlay */}
+        {displayFile && !pdfDoc && !loadError && (
+          <Box sx={{
+            position: 'absolute', inset: 0, zIndex: 10,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            backgroundColor: T.viewerBg,
+          }}>
+            <CircularProgress sx={{ color: T.blue }} />
+          </Box>
+        )}
+
+        {/* Sidebar */}
+        {sidebarOpen && (
+          <Box sx={{
+            width: SIDEBAR_W, flexShrink: 0,
+            borderRight: `1px solid ${T.border}`, backgroundColor: T.sidebarBg,
+            display: 'flex', flexDirection: 'column', overflow: 'hidden',
+          }}>
+            <Tabs value={sidebarTab} onChange={(_, v) => setSidebarTab(v)} sx={{
+              minHeight: 36, backgroundColor: T.sidebarTabBg, flexShrink: 0,
+              borderBottom: `1px solid ${T.border}`,
+              '& .MuiTab-root': { color: T.textMuted, minHeight: 36, py: 0.5, fontSize: '0.7rem' },
+              '& .Mui-selected': { color: T.blue, fontWeight: 700 },
+              '& .MuiTabs-indicator': { backgroundColor: T.blue, height: 3, borderRadius: '3px 3px 0 0' },
             }}>
-              <Tabs value={sidebarTab} onChange={(_, v) => setSidebarTab(v)} sx={{
-                minHeight: 36, backgroundColor: T.sidebarTabBg, flexShrink: 0,
-                borderBottom: `1px solid ${T.border}`,
-                '& .MuiTab-root': { color: T.textMuted, minHeight: 36, py: 0.5, fontSize: '0.7rem' },
-                '& .Mui-selected': { color: T.blue, fontWeight: 700 },
-                '& .MuiTabs-indicator': { backgroundColor: T.blue, height: 3, borderRadius: '3px 3px 0 0' },
-              }}>
-                <Tab value="thumbnails"  label="Pages"       icon={<ViewStreamOutlined sx={{ fontSize: 14 }} />} iconPosition="start" />
-                <Tab value="outline"     label="Outline"     icon={<BookmarkOutlined   sx={{ fontSize: 14 }} />} iconPosition="start" />
-                <Tab value="attachments" label="Attachments" icon={<AttachFileOutlined sx={{ fontSize: 14 }} />} iconPosition="start" />
-              </Tabs>
-              <Box sx={{
-                flex: 1, overflow: 'auto',
-                '&::-webkit-scrollbar': { width: 4 },
-                '&::-webkit-scrollbar-thumb': { backgroundColor: T.scrollThumb, borderRadius: 2 },
-              }}>
-                {sidebarTab === 'thumbnails' && numPages > 0 && (
-                  <ThumbnailSidebar numPages={numPages} currentPage={currentPage} onPageClick={goToPage} />
-                )}
-                {sidebarTab === 'outline' && (
-                  <Box sx={{ p: 1 }}>
-                    <Outline onItemClick={({ pageNumber }) => goToPage(pageNumber)} onLoadError={() => {}} />
-                  </Box>
-                )}
-                {sidebarTab === 'attachments' && (
-                  <AttachmentsSidebar attachments={attachments} />
-                )}
-              </Box>
+              <Tab value="thumbnails"  label="Pages"       icon={<ViewStreamOutlined sx={{ fontSize: 14 }} />} iconPosition="start" />
+              <Tab value="outline"     label="Outline"     icon={<BookmarkOutlined   sx={{ fontSize: 14 }} />} iconPosition="start" />
+              <Tab value="attachments" label="Attachments" icon={<AttachFileOutlined sx={{ fontSize: 14 }} />} iconPosition="start" />
+            </Tabs>
+            <Box sx={{
+              flex: 1, overflow: 'auto',
+              '&::-webkit-scrollbar': { width: 4 },
+              '&::-webkit-scrollbar-thumb': { backgroundColor: T.scrollThumb, borderRadius: 2 },
+            }}>
+              {sidebarTab === 'thumbnails' && pdfDoc && numPages > 0 && (
+                <ThumbnailSidebar pdf={pdfDoc} numPages={numPages} currentPage={currentPage} onPageClick={goToPage} />
+              )}
+              {sidebarTab === 'outline' && (
+                <Box sx={{ p: 1 }}>
+                  <PdfOutline pdf={pdfDoc} onItemClick={(dest) => {
+                    if (typeof dest === 'number') goToPage(dest + 1);
+                  }} />
+                </Box>
+              )}
+              {sidebarTab === 'attachments' && (
+                <AttachmentsSidebar attachments={attachments} />
+              )}
+            </Box>
+          </Box>
+        )}
+
+        {/* Main page viewer */}
+        <Box
+          ref={viewerRef}
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          sx={{
+            flex: 1, minHeight: 0, overflowX: 'hidden', overflowY: 'auto',
+            position: 'relative',
+            backgroundColor: isDragOver ? T.blueActive : T.viewerBg,
+            outline: isDragOver ? `3px dashed ${T.blue}` : 'none',
+            cursor: selectMode === 'hand' ? 'grab' : 'text',
+            '&::-webkit-scrollbar':       { width: 8 },
+            '&::-webkit-scrollbar-thumb': { backgroundColor: T.scrollThumb, borderRadius: 4 },
+            '&::-webkit-scrollbar-track': { backgroundColor: T.scrollTrack },
+          }}
+        >
+          {isDragOver && (
+            <Box sx={{
+              position: 'absolute', inset: 0, zIndex: 5, display: 'flex',
+              alignItems: 'center', justifyContent: 'center', flexDirection: 'column',
+              pointerEvents: 'none', gap: 1, color: T.blue,
+            }}>
+              <FileOpenOutlined sx={{ fontSize: 48 }} />
+              <Typography variant="body1" fontWeight={600}>Drop PDF to open</Typography>
             </Box>
           )}
 
-          {/* Main page viewer */}
-          <Box
-            ref={viewerRef}
-            onDragEnter={handleDragEnter}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-            sx={{
-              flex: 1, minHeight: 0, overflowX: 'hidden', overflowY: 'auto',
-              position: 'relative',
-              backgroundColor: isDragOver ? T.blueActive : T.viewerBg,
-              outline: isDragOver ? `3px dashed ${T.blue}` : 'none',
-              cursor: selectMode === 'hand' ? 'grab' : 'text',
-              '&::-webkit-scrollbar':       { width: 8 },
-              '&::-webkit-scrollbar-thumb': { backgroundColor: T.scrollThumb, borderRadius: 4 },
-              '&::-webkit-scrollbar-track': { backgroundColor: T.scrollTrack },
-            }}
-          >
-            {isDragOver && (
-              <Box sx={{
-                position: 'absolute', inset: 0, zIndex: 5, display: 'flex',
-                alignItems: 'center', justifyContent: 'center', flexDirection: 'column',
-                pointerEvents: 'none', gap: 1, color: T.blue,
-              }}>
-                <FileOpenOutlined sx={{ fontSize: 48 }} />
-                <Typography variant="body1" fontWeight={600}>Drop PDF to open</Typography>
-              </Box>
-            )}
+          {searchOpen && (
+            <SearchPanel
+              query={searchQuery} matchPages={matchPages}
+              matchIdx={matchIdx} searching={isSearching}
+              onQueryChange={setSearchQuery}
+              onPrev={() => setMatchIdx((i) => (i - 1 + matchPages.length) % matchPages.length)}
+              onNext={() => setMatchIdx((i) => (i + 1) % matchPages.length)}
+              onClose={() => { setSearchOpen(false); setSearchQuery(''); }}
+            />
+          )}
 
-            {searchOpen && (
-              <SearchPanel
-                query={searchQuery} matchPages={matchPages}
-                matchIdx={matchIdx} searching={isSearching}
-                onQueryChange={setSearchQuery}
-                onPrev={() => setMatchIdx((i) => (i - 1 + matchPages.length) % matchPages.length)}
-                onNext={() => setMatchIdx((i) => (i + 1) % matchPages.length)}
-                onClose={() => { setSearchOpen(false); setSearchQuery(''); }}
-              />
-            )}
+          {loadError && <Alert severity="error" sx={{ m: 2 }}>{loadError}</Alert>}
 
-            {loadError && <Alert severity="error" sx={{ m: 2 }}>{loadError}</Alert>}
+          {pdfDoc && (scrollMode === 'continuous'
+            ? pages.map((n) => (
+                <Box
+                  key={n}
+                  ref={(el) => { pageRefs.current[n - 1] = el as HTMLDivElement | null; }}
+                  sx={{ display: 'flex', justifyContent: 'center', p: '8px 8px 0 8px' }}
+                  aria-label={`Page ${n}`}
+                >
+                  <Paper elevation={4} sx={{ lineHeight: 0 }}>
+                    <PdfPage
+                      pdf={pdfDoc}
+                      pageNumber={n}
+                      scale={scale}
+                      rotation={rotation}
+                      renderTextLayer={selectMode === 'text'}
+                      renderAnnotationLayer
+                      customTextRenderer={searchQuery ? customTextRenderer : undefined}
+                      onLoadSuccess={n === 1 ? handlePageLoadSuccess : undefined}
+                      linkService={linkServiceRef.current}
+                    />
+                  </Paper>
+                </Box>
+              ))
+            : (
+                <Box sx={{ display: 'flex', justifyContent: 'center', p: 2 }}>
+                  <Paper elevation={4} sx={{ lineHeight: 0 }}>
+                    <PdfPage
+                      pdf={pdfDoc}
+                      pageNumber={currentPage}
+                      scale={scale}
+                      rotation={rotation}
+                      renderTextLayer={selectMode === 'text'}
+                      renderAnnotationLayer
+                      customTextRenderer={searchQuery ? customTextRenderer : undefined}
+                      onLoadSuccess={handlePageLoadSuccess}
+                      linkService={linkServiceRef.current}
+                    />
+                  </Paper>
+                </Box>
+              )
+          )}
 
-            {scrollMode === 'continuous'
-              ? pages.map((n) => (
-                  <Box
-                    key={n}
-                    ref={(el) => { pageRefs.current[n - 1] = el as HTMLDivElement | null; }}
-                    sx={{ display: 'flex', justifyContent: 'center', p: '8px 8px 0 8px' }}
-                    aria-label={`Page ${n}`}
-                  >
-                    <Paper elevation={4} sx={{ lineHeight: 0 }}>
-                      <Page
-                        pageNumber={n}
-                        scale={scale}
-                        rotate={rotation}
-                        renderTextLayer={selectMode === 'text'}
-                        renderAnnotationLayer
-                        customTextRenderer={searchQuery ? customTextRenderer : undefined}
-                        onLoadSuccess={n === 1 ? handlePageLoadSuccess : undefined}
-                        loading={
-                          <Skeleton variant="rectangular"
-                            width={Math.round((origPageWidth  || 595) * scale)}
-                            height={Math.round((origPageHeight || 842) * scale)}
-                          />
-                        }
-                      />
-                    </Paper>
-                  </Box>
-                ))
-              : (
-                  <Box sx={{ display: 'flex', justifyContent: 'center', p: 2 }}>
-                    <Paper elevation={4} sx={{ lineHeight: 0 }}>
-                      <Page
-                        pageNumber={currentPage}
-                        scale={scale}
-                        rotate={rotation}
-                        renderTextLayer={selectMode === 'text'}
-                        renderAnnotationLayer
-                        customTextRenderer={searchQuery ? customTextRenderer : undefined}
-                        onLoadSuccess={handlePageLoadSuccess}
-                        loading={
-                          <Skeleton variant="rectangular"
-                            width={Math.round((origPageWidth  || 595) * scale)}
-                            height={Math.round((origPageHeight || 842) * scale)}
-                          />
-                        }
-                      />
-                    </Paper>
-                  </Box>
-                )
-            }
-
-            {scrollMode === 'continuous' && numPages > 0 && <Box sx={{ height: 16 }} />}
-          </Box>
-        </Document>
+          {scrollMode === 'continuous' && numPages > 0 && <Box sx={{ height: 16 }} />}
+        </Box>
       </Box>
 
       <PropertiesDialog open={propertiesOpen} info={pdfProperties} onClose={() => setPropertiesOpen(false)} />

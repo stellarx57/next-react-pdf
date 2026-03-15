@@ -1,3 +1,5 @@
+import * as pdfjs from 'pdfjs-dist';
+
 /**
  * Configures the PDF.js worker URL.
  *
@@ -16,17 +18,5 @@
  */
 export function configurePdfWorker(workerSrc: string): void {
   if (typeof window === 'undefined') return;
-  // Import pdfjs lazily to keep config.ts out of the server bundle.
-  // The dynamic import resolves before any PdfViewer can render because
-  // this function is expected to be called at module evaluation time of a
-  // 'use client' component, which executes before React trees are rendered.
-  import('react-pdf')
-    .then(({ pdfjs }) => {
-      pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
-    })
-    .catch((err) => {
-      if (process.env.NODE_ENV !== 'production') {
-        console.warn('[next-react-pdf] configurePdfWorker failed to load react-pdf:', err);
-      }
-    });
+  pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
 }

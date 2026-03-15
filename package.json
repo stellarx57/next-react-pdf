@@ -1,6 +1,6 @@
 {
   "name": "next-react-pdf",
-  "version": "1.0.3",
+  "version": "2.0.0",
   "description": "A feature-rich, SSR-safe PDF viewer component for Next.js and React with Material-UI — thumbnails, outline, search, zoom, rotation, attachments, full-screen, and more.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -75,8 +75,7 @@
     "next": "^14.0.0 || ^15.0.0",
     "pdfjs-dist": "^5.0.0",
     "react": "^18.0.0 || ^19.0.0",
-    "react-dom": "^18.0.0 || ^19.0.0",
-    "react-pdf": "^9.0.0 || ^10.0.0"
+    "react-dom": "^18.0.0 || ^19.0.0"
   },
   "devDependencies": {
     "@emotion/react": "^11.11.3",
@@ -90,7 +89,6 @@
     "pdfjs-dist": "5.4.296",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-pdf": "^10.4.1",
     "tsup": "^8.0.1",
     "typescript": "^5.3.3"
   }
