@@ -26,36 +26,41 @@ const projectRoot = process.cwd();
 const publicDir   = path.join(projectRoot, 'public');
 const destFile    = path.join(publicDir, 'pdf.worker.min.js');
 
-let workerSrc;
+let pkgDir;
 try {
-  const pkgDir = path.dirname(
+  pkgDir = path.dirname(
     require.resolve('pdfjs-dist/package.json', { paths: [projectRoot] }),
   );
-  workerSrc = path.join(pkgDir, 'build', 'pdf.worker.min.js');
 } catch {
   console.error(
     '[next-react-pdf] ERROR: pdfjs-dist is not installed in this project.\n' +
-    '  Install react-pdf (which includes pdfjs-dist) as a peer dependency:\n' +
-    '  npm install react-pdf pdfjs-dist',
+    '  Install it as a peer dependency:\n' +
+    '  npm install pdfjs-dist',
   );
   process.exit(1);
 }
 
-if (!existsSync(workerSrc)) {
-  // pdfjs-dist v4+ ships .mjs workers — fall back gracefully.
-  const mjs = workerSrc.replace('.js', '.mjs');
-  if (existsSync(mjs)) {
-    workerSrc = mjs;
-  } else {
-    console.error(
-      `[next-react-pdf] ERROR: pdf.worker bundle not found at:\n  ${workerSrc}\n` +
-      '  Please check your pdfjs-dist installation.',
-    );
-    process.exit(1);
-  }
+// Probe multiple candidate paths in priority order to support pdfjs-dist v3/v4/v5+
+const candidates = [
+  path.join(pkgDir, 'build', 'pdf.worker.min.mjs'),
+  path.join(pkgDir, 'build', 'pdf.worker.min.js'),
+  path.join(pkgDir, 'legacy', 'build', 'pdf.worker.min.js'),
+  path.join(pkgDir, 'legacy', 'build', 'pdf.worker.min.mjs'),
+];
+
+const workerSrc = candidates.find((c) => existsSync(c));
+
+if (!workerSrc) {
+  console.error(
+    '[next-react-pdf] ERROR: pdf.worker bundle not found. Checked:\n' +
+    candidates.map((c) => `  ${c}`).join('\n') + '\n' +
+    '  Please check your pdfjs-dist installation.',
+  );
+  process.exit(1);
 }
 
 if (!existsSync(publicDir)) mkdirSync(publicDir, { recursive: true });
 
 copyFileSync(workerSrc, destFile);
 console.log(`[next-react-pdf] ✓ Copied ${path.basename(workerSrc)} → public/pdf.worker.min.js`);
+

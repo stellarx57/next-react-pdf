@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 /**
- * Prepends "use client" to every .js and .mjs file in dist/.
- * Required for Next.js App Router to recognise the package as client-only.
+ * Prepends "use client" to PdfViewerClient and chunk files in dist/.
+ *
+ * IMPORTANT: "use client" must NOT be added to index.js/index.mjs because
+ * that file is the SSR-safe entry point (it uses next/dynamic with ssr:false)
+ * and needs to remain importable from Server Components.  Only the actual
+ * client-rendering module (PdfViewerClient) and its split chunks need the
+ * directive.
  */
 'use strict';
 
@@ -17,7 +22,12 @@ if (!existsSync(distDir)) {
 }
 
 readdirSync(distDir)
-  .filter((f) => f.endsWith('.js') || f.endsWith('.mjs'))
+  .filter((f) => {
+    // Only PdfViewerClient files and shared chunks — never index.*
+    if (!f.endsWith('.js') && !f.endsWith('.mjs')) return false;
+    if (f.startsWith('index.')) return false; // skip SSR-safe entry
+    return true; // PdfViewerClient.* and chunk-*.* files
+  })
   .forEach((file) => {
     const fullPath = path.join(distDir, file);
     const content  = readFileSync(fullPath, 'utf8');

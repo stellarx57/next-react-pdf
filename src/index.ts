@@ -2,5 +2,5 @@
 // PdfViewerClient is a separate entry — import via 'next-react-pdf/PdfViewerClient'
 // if you manage the dynamic import yourself.
 export { default as PdfViewer } from './PdfViewer';
-export type { PdfViewerProps, PdfDocumentOptions } from './PdfViewerClient';
+export type { PdfViewerProps, PdfDocumentOptions, PdfViewerHandle, PdfViewerTheme } from './PdfViewerClient';
 export { configurePdfWorker } from './config';

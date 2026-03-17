@@ -12,15 +12,14 @@ if (typeof window !== 'undefined' && !pdfjs.GlobalWorkerOptions.workerSrc) {
 }
 
 import React, {
-  forwardRef, useCallback, useEffect, useImperativeHandle,
-  useMemo, useRef, useState,
+  useCallback, useEffect, useMemo, useRef, useState,
   type ChangeEvent, type DragEvent, type KeyboardEvent,
 } from 'react';
-import type { SxProps } from '@mui/material';
+
 import {
   Alert, Box, CircularProgress, Dialog, DialogContent, DialogTitle,
-  Divider, IconButton, InputBase, LinearProgress, List, ListItemButton,
-  ListItemText, MenuItem, Paper, Select, Skeleton, Tab, Tabs, Tooltip, Typography,
+  Divider, IconButton, InputBase, List, ListItemButton, ListItemText,
+  MenuItem, Paper, Select, Skeleton, Tab, Tabs, Tooltip, Typography,
 } from '@mui/material';
 import {
   AttachFileOutlined, BookmarkBorderOutlined, BookmarkOutlined,
@@ -44,7 +43,7 @@ export interface PdfDocumentOptions {
   /** Send cookies with cross-origin requests. */
   withCredentials?: boolean;
   /** Password for password-protected PDFs. */
-  pdfPassword?: string;
+  password?: string;
   /** Any additional options understood by pdfjs `getDocument()`. */
   [key: string]: unknown;
 }
@@ -109,80 +108,6 @@ export interface PdfViewerProps {
    * Defaults to `false`.
    */
   disableAuth?: boolean;
-  // ── Callbacks ────────────────────────────────────────────────────────────
-  /** Fired when the zoom scale changes. Receives the scale factor (1.0 = 100%). */
-  onZoomChange?: (scale: number) => void;
-  /** Fired when rotation changes. Receives degrees: 0, 90, 180 or 270. */
-  onRotationChange?: (degrees: number) => void;
-  /** Fired when full-screen state toggles. */
-  onFullscreenChange?: (isFullscreen: boolean) => void;
-  /** Fired when scroll mode toggles. */
-  onScrollModeChange?: (mode: 'continuous' | 'single') => void;
-  // ── Feature flags ────────────────────────────────────────────────────────
-  /** Show the Download button. Defaults to `true`. */
-  showDownload?: boolean;
-  /** Show the Print button. Defaults to `true`. */
-  showPrint?: boolean;
-  /** Show the Open-local-file button. Defaults to `true`. */
-  showOpenFile?: boolean;
-  /** Show the sidebar. Defaults to `true`. */
-  showSidebar?: boolean;
-  /** Show the Search button. Defaults to `true`. */
-  showSearch?: boolean;
-  /** Show the Rotate buttons. Defaults to `true`. */
-  showRotation?: boolean;
-  /** Show the Full-screen button. Defaults to `true`. */
-  showFullscreen?: boolean;
-  /** Allow drag-and-drop of local PDF files. Defaults to `true`. */
-  allowFileOpen?: boolean;
-  // ── Appearance ───────────────────────────────────────────────────────────
-  /**
-   * Height of the viewer. Accepts any valid CSS value or a number (treated as px).
-   * Defaults to `'100%'`.
-   */
-  height?: number | string;
-  /** Extra CSS class applied to the viewer root element. */
-  className?: string;
-  /** MUI sx prop applied to the viewer root element. */
-  sx?: SxProps;
-  /**
-   * Override specific theme colour tokens.
-   * @example `{ blue: '#E53935' }`
-   */
-  theme?: Partial<PdfViewerTheme>;
-  /** Whether the sidebar panel is open by default. Defaults to `false`. */
-  defaultSidebarOpen?: boolean;
-  /** Which sidebar tab is active by default. Defaults to `'thumbnails'`. */
-  defaultSidebarTab?: 'thumbnails' | 'outline' | 'attachments';
-}
-
-/**
- * Imperative handle exposed via `ref` when using `React.forwardRef`.
- *
- * @example
- * ```tsx
- * const ref = useRef<PdfViewerHandle>(null);
- * <PdfViewer ref={ref} fileUrl={url} />
- * ref.current?.goToPage(5);
- * ```
- */
-export interface PdfViewerHandle {
-  /** Navigate to a specific page (1-based). */
-  goToPage: (page: number) => void;
-  /** Set zoom to a scale factor (e.g. 1.5) or a preset string. */
-  zoomTo: (scale: number | 'page-fit' | 'page-width') => void;
-  /** Open the search panel. */
-  openSearch: () => void;
-  /** Close the search panel and clear the query. */
-  closeSearch: () => void;
-  /** Rotate the document left (−90°). */
-  rotateLeft: () => void;
-  /** Rotate the document right (+90°). */
-  rotateRight: () => void;
-  /** Return the currently visible page number (1-based). */
-  getCurrentPage: () => number;
-  /** Return the total page count of the loaded document. */
-  getNumPages: () => number;
 }
 
 // ─── Internal types ───────────────────────────────────────────────────────────
@@ -210,25 +135,7 @@ interface PdfProperties {
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
 
-export interface PdfViewerTheme {
-  toolbarBg:     string;
-  toolbarBorder: string;
-  sidebarBg:     string;
-  sidebarTabBg:  string;
-  viewerBg:      string;
-  blue:          string;
-  blueDark:      string;
-  blueHover:     string;
-  blueActive:    string;
-  textPrimary:   string;
-  textMuted:     string;
-  textIcon:      string;
-  border:        string;
-  scrollThumb:   string;
-  scrollTrack:   string;
-}
-
-const DEFAULT_THEME: PdfViewerTheme = {
+const T = {
   toolbarBg:     '#FFFFFF',
   toolbarBorder: '#DDE3EF',
   sidebarBg:     '#F4F6FB',
@@ -244,10 +151,7 @@ const DEFAULT_THEME: PdfViewerTheme = {
   border:        '#DDE3EF',
   scrollThumb:   '#90A4AE',
   scrollTrack:   '#D7DCE8',
-};
-
-// Module-level alias for sub-components that don't accept a theme prop.
-const T = DEFAULT_THEME;
+} as const;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -259,7 +163,6 @@ const ZOOM_MAX       = 4.0;
 const ZOOM_STEP      = 0.25;
 const THUMB_W        = 140;
 const SEARCH_DEBOUNCE_MS = 350;
-const SEARCH_CONCURRENCY = 8;
 
 const ZOOM_OPTIONS: { label: string; value: number | null; preset: ZoomPreset }[] = [
   { label: 'Page Fit',    value: null, preset: 'page-fit'   },
@@ -274,23 +177,6 @@ const ZOOM_OPTIONS: { label: string; value: number | null; preset: ZoomPreset }[
   { label: '300%',        value: 3.00, preset: 'custom'     },
   { label: '400%',        value: 4.00, preset: 'custom'     },
 ];
-
-// ─── Security helpers ─────────────────────────────────────────────────────────────
-
-/**
- * Returns true for URLs that are safe to pass to PDF.js / fetch.
- * Rejects javascript:, data:javascript:, file:// (outside blob/data), vbscript:, etc.
- */
-function isSafeFileUrl(url: string): boolean {
-  if (!url) return false;
-  try {
-    const parsed = new URL(url, typeof window !== 'undefined' ? window.location.href : 'http://localhost');
-    return ['http:', 'https:', 'blob:', 'data:'].includes(parsed.protocol);
-  } catch {
-    // Relative paths starting with / ./ or ../ are safe
-    return url.startsWith('/') || url.startsWith('./') || url.startsWith('../');
-  }
-}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -426,27 +312,14 @@ const LAYER_CSS = `
 }
 `;
 
-let _cssRefCount = 0;
-
-function usePdfLayerCss() {
-  useEffect(() => {
-    _cssRefCount++;
-    if (_cssRefCount === 1 && typeof document !== 'undefined') {
-      const id = 'nrp-layer-css';
-      if (!document.getElementById(id)) {
-        const style = document.createElement('style');
-        style.id = id;
-        style.textContent = LAYER_CSS;
-        document.head.appendChild(style);
-      }
-    }
-    return () => {
-      _cssRefCount--;
-      if (_cssRefCount === 0 && typeof document !== 'undefined') {
-        document.getElementById('nrp-layer-css')?.remove();
-      }
-    };
-  }, []);
+if (typeof document !== 'undefined') {
+  const id = 'nrp-layer-css';
+  if (!document.getElementById(id)) {
+    const style = document.createElement('style');
+    style.id = id;
+    style.textContent = LAYER_CSS;
+    document.head.appendChild(style);
+  }
 }
 
 // ─── PdfPage — renders a single PDF page using pdfjs-dist directly ────────────
@@ -471,44 +344,19 @@ interface PdfPageProps {
   linkService?: SimpleLinkService;
   /** Extra inline style on the page root. */
   style?: React.CSSProperties;
-  /** Estimated page width in unscaled CSS px (used for skeleton sizing). */
-  estimatedWidth?: number;
-  /** Estimated page height in unscaled CSS px (used for skeleton sizing). */
-  estimatedHeight?: number;
 }
 
-const PdfPage = React.memo(function PdfPage({
+function PdfPage({
   pdf, pageNumber, scale, rotation,
   renderTextLayer: doText,
   renderAnnotationLayer: doAnnot,
   onLoadSuccess, loading, customTextRenderer, linkService, style,
-  estimatedWidth, estimatedHeight,
 }: PdfPageProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [loaded, setLoaded]       = useState(false);
   const [renderErr, setRenderErr] = useState<string | null>(null);
 
-  // ── Strict Mode guard ───────────────────────────────────────────────────────
-  // React Strict Mode runs mount→unmount→remount synchronously in development.
-  // PDF.js manages canvas nodes imperatively outside React's vDOM. If the real
-  // render starts during the fake first mount it will conflict with cleanup that
-  // fires during fake unmount, causing a removeChild NotFoundError.
-  //
-  // Solution: defer PDF initialisation to the macrotask queue via setTimeout(0).
-  // The Strict Mode cycle is synchronous, so the deferred callback only fires on
-  // the stable real mount — after the fake cycle is complete.
-  const [canRender, setCanRender] = useState(false);
-
   useEffect(() => {
-    const id = setTimeout(() => setCanRender(true), 0);
-    return () => {
-      clearTimeout(id);
-      setCanRender(false);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!canRender) return;
     const container = containerRef.current;
     if (!container) return;
 
@@ -518,6 +366,8 @@ const PdfPage = React.memo(function PdfPage({
 
     setLoaded(false);
     setRenderErr(null);
+
+    // Clear previous content
     container.innerHTML = '';
 
     const run = async () => {
@@ -536,12 +386,9 @@ const PdfPage = React.memo(function PdfPage({
       canvas.height       = Math.floor(viewport.height * outputScale);
       canvas.style.width  = `${viewport.width}px`;
       canvas.style.height = `${viewport.height}px`;
-      canvas.style.display  = 'block';
+      canvas.style.display = 'block';
       canvas.style.position = 'relative';
       canvas.style.zIndex   = '1';
-      // Accessible label for screen readers
-      canvas.setAttribute('role', 'img');
-      canvas.setAttribute('aria-label', `PDF page ${pageNumber} rendered content`);
 
       container.style.position = 'relative';
       container.style.width    = `${viewport.width}px`;
@@ -567,6 +414,7 @@ const PdfPage = React.memo(function PdfPage({
         const textContent = await page.getTextContent();
         if (cancelled) return;
 
+        // Apply custom highlight renderer if provided
         if (customTextRenderer) {
           textContent.items.forEach((item) => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -601,24 +449,24 @@ const PdfPage = React.memo(function PdfPage({
           const ls = linkService ?? new SimpleLinkService();
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const annLayer = new (pdfjs as any).AnnotationLayer({
-            div:                       annotDiv,
-            accessibilityManager:      null,
-            annotationCanvasMap:       null,
-            annotationEditorUIManager: null,
+            div:                      annotDiv,
+            accessibilityManager:     null,
+            annotationCanvasMap:      null,
+            annotationEditorUIManager:null,
             page,
-            viewport:                  viewport.clone({ dontFlip: true }),
-            structTreeLayer:           null,
-            commentManager:            null,
-            linkService:               ls,
-            annotationStorage:         null,
+            viewport:                 viewport.clone({ dontFlip: true }),
+            structTreeLayer:          null,
+            commentManager:           null,
+            linkService:              ls,
+            annotationStorage:        null,
           });
           await annLayer.render({
             viewport: viewport.clone({ dontFlip: true }),
             div:      annotDiv,
             annotations,
             page,
-            linkService:  ls,
-            renderForms:  false,
+            linkService:    ls,
+            renderForms:    false,
           } as AnnotationLayerParameters);
         } catch { /* non-critical; omit annotation layer gracefully */ }
         if (cancelled) return;
@@ -637,58 +485,38 @@ const PdfPage = React.memo(function PdfPage({
       try { renderTask?.cancel(); } catch { /* ignore */ }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canRender, pdf, pageNumber, scale, rotation, doText, doAnnot]);
+  }, [pdf, pageNumber, scale, rotation, doText, doAnnot]);
 
-  // Skeleton dimensions: use passed estimates so the placeholder accurately
-  // reflects the actual page size, avoiding layout shift for non-A4 documents.
-  const skeletonW = estimatedWidth  ? Math.round(estimatedWidth  * scale) : Math.round(595 * scale);
-  const skeletonH = estimatedHeight ? Math.round(estimatedHeight * scale) : Math.round(842 * scale);
+  const viewport = useMemo(() => {
+    // Derive dimensions without rendering — for skeleton sizing
+    // This is a rough estimate (595 × 842 is A4 at 72 dpi)
+    return { width: 595 * scale, height: 842 * scale };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scale]);
 
   if (renderErr) return (
     <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center',
-      width: skeletonW, height: skeletonH, color: '#EF5350' }}>
+      width: viewport.width, height: viewport.height, color: '#EF5350' }}>
       <WarningAmberOutlined sx={{ mr: 0.5, fontSize: 16 }} />
       <Typography variant="caption">{renderErr}</Typography>
     </Box>
   );
 
-  // ── Render ──────────────────────────────────────────────────────────────────
-  // IMPORTANT: keep the loading placeholder (Skeleton / custom) as a SIBLING of
-  // containerRef, not a child of it.
-  //
-  // The render effect calls `container.innerHTML = ''` (to reset between renders)
-  // which imperatively removes every DOM child of containerRef — including any
-  // React-managed node that was placed there.  If the Skeleton were inside
-  // containerRef, React would later call removeChild(skeletonNode) in its
-  // reconciler and get a `NotFoundError` (the node was already removed by the
-  // innerHTML reset), throwing into the nearest error boundary on every render.
-  //
-  // By keeping the Skeleton as a sibling, containerRef always starts empty from
-  // React's perspective; innerHTML = '' is a no-op on it, and React can cleanly
-  // remove the Skeleton from the outer wrapper when `loaded` flips to true.
   return (
     <div
+      ref={containerRef}
       style={{ position: 'relative', display: 'inline-block', lineHeight: 0, ...style }}
       aria-label={`PDF page ${pageNumber}`}
     >
       {!loaded && (loading ?? (
-        <Skeleton variant="rectangular" width={skeletonW} height={skeletonH} />
+        <Skeleton variant="rectangular"
+          width={Math.round(viewport.width)}
+          height={Math.round(viewport.height)}
+        />
       ))}
-      {/* containerRef: purely imperative — React renders no children here */}
-      <div ref={containerRef} style={{ display: loaded ? 'block' : 'none' }} />
     </div>
   );
-}, (prev, next) =>
-  prev.pdf            === next.pdf            &&
-  prev.pageNumber     === next.pageNumber     &&
-  prev.scale          === next.scale          &&
-  prev.rotation       === next.rotation       &&
-  prev.renderTextLayer       === next.renderTextLayer       &&
-  prev.renderAnnotationLayer === next.renderAnnotationLayer &&
-  prev.customTextRenderer    === next.customTextRenderer    &&
-  prev.estimatedWidth  === next.estimatedWidth &&
-  prev.estimatedHeight === next.estimatedHeight
-);
+}
 
 // ─── PdfOutline — renders the document's table of contents ───────────────────
 
@@ -827,13 +655,6 @@ interface ToolbarProps {
   onProperties:   () => void;
   onSidebarTab:   (tab: SidebarTab) => void;
   onSearchToggle: () => void;
-  showDownload:   boolean;
-  showPrint:      boolean;
-  showOpenFile:   boolean;
-  showSidebar:    boolean;
-  showSearch:     boolean;
-  showRotation:   boolean;
-  showFullscreen: boolean;
 }
 
 const DIVIDER_SX = { borderColor: T.border, mx: 0.5, height: 24, alignSelf: 'center' };
@@ -851,6 +672,7 @@ function Toolbar(p: ToolbarProps) {
     if (e.key === 'Enter') commitPage();
   };
 
+  // 'Actual Size' preset must match the ZOOM_OPTIONS label exactly.
   const zoomLabel =
     p.zoomPreset === 'page-fit'   ? 'Page Fit'    :
     p.zoomPreset === 'page-width' ? 'Page Width'  :
@@ -866,20 +688,17 @@ function Toolbar(p: ToolbarProps) {
     }} role="toolbar" aria-label="PDF viewer toolbar">
 
       {/* Sidebar toggles */}
-      {p.showSidebar && (
-        <>
-          <Btn title="Thumbnails" onClick={() => p.onSidebarTab('thumbnails')} active={p.sidebarOpen && p.sidebarTab === 'thumbnails'}>
-            <ViewStreamOutlined sx={{ fontSize: 18 }} />
-          </Btn>
-          <Btn title="Table of Contents" onClick={() => p.onSidebarTab('outline')} active={p.sidebarOpen && p.sidebarTab === 'outline'}>
-            <BookmarkBorderOutlined sx={{ fontSize: 18 }} />
-          </Btn>
-          <Btn title="Attachments" onClick={() => p.onSidebarTab('attachments')} active={p.sidebarOpen && p.sidebarTab === 'attachments'}>
-            <AttachFileOutlined sx={{ fontSize: 18 }} />
-          </Btn>
-          <Divider orientation="vertical" sx={DIVIDER_SX} />
-        </>
-      )}
+      <Btn title="Thumbnails" onClick={() => p.onSidebarTab('thumbnails')} active={p.sidebarOpen && p.sidebarTab === 'thumbnails'}>
+        <ViewStreamOutlined sx={{ fontSize: 18 }} />
+      </Btn>
+      <Btn title="Table of Contents" onClick={() => p.onSidebarTab('outline')} active={p.sidebarOpen && p.sidebarTab === 'outline'}>
+        <BookmarkBorderOutlined sx={{ fontSize: 18 }} />
+      </Btn>
+      <Btn title="Attachments" onClick={() => p.onSidebarTab('attachments')} active={p.sidebarOpen && p.sidebarTab === 'attachments'}>
+        <AttachFileOutlined sx={{ fontSize: 18 }} />
+      </Btn>
+
+      <Divider orientation="vertical" sx={DIVIDER_SX} />
 
       {/* Page navigation */}
       <Btn title="First page (Home)" onClick={p.onFirstPage} disabled={p.currentPage <= 1}>
@@ -944,18 +763,15 @@ function Toolbar(p: ToolbarProps) {
         <ZoomInOutlined sx={{ fontSize: 18 }} />
       </Btn>
 
+      <Divider orientation="vertical" sx={DIVIDER_SX} />
+
       {/* Rotate */}
-      {p.showRotation && (
-        <>
-          <Divider orientation="vertical" sx={DIVIDER_SX} />
-          <Btn title="Rotate left"  onClick={p.onRotateLeft}>
-            <RotateLeftOutlined sx={{ fontSize: 18 }} />
-          </Btn>
-          <Btn title="Rotate right" onClick={p.onRotateRight}>
-            <RotateRightOutlined sx={{ fontSize: 18 }} />
-          </Btn>
-        </>
-      )}
+      <Btn title="Rotate left"  onClick={p.onRotateLeft}>
+        <RotateLeftOutlined sx={{ fontSize: 18 }} />
+      </Btn>
+      <Btn title="Rotate right" onClick={p.onRotateRight}>
+        <RotateRightOutlined sx={{ fontSize: 18 }} />
+      </Btn>
 
       <Divider orientation="vertical" sx={DIVIDER_SX} />
 
@@ -967,40 +783,30 @@ function Toolbar(p: ToolbarProps) {
         onClick={p.onScrollToggle} active={p.scrollMode === 'single'}>
         <ViewDayOutlined sx={{ fontSize: 18 }} />
       </Btn>
-      {p.showSearch && (
-        <Btn title="Search in document" onClick={p.onSearchToggle} active={p.searchOpen}>
-          <SearchOutlined sx={{ fontSize: 18 }} />
-        </Btn>
-      )}
+      <Btn title="Search in document" onClick={p.onSearchToggle} active={p.searchOpen}>
+        <SearchOutlined sx={{ fontSize: 18 }} />
+      </Btn>
 
       <Divider orientation="vertical" sx={DIVIDER_SX} />
 
       {/* File operations */}
-      {p.showOpenFile && (
-        <Btn title="Open local file" onClick={p.onOpenFile}>
-          <FileOpenOutlined sx={{ fontSize: 18 }} />
-        </Btn>
-      )}
-      {p.showDownload && (
-        <Btn title="Download" onClick={p.onDownload}>
-          <CloudDownloadOutlined sx={{ fontSize: 18 }} />
-        </Btn>
-      )}
-      {p.showPrint && (
-        <Btn title="Print" onClick={p.onPrint}>
-          <PrintOutlined sx={{ fontSize: 18 }} />
-        </Btn>
-      )}
+      <Btn title="Open local file" onClick={p.onOpenFile}>
+        <FileOpenOutlined sx={{ fontSize: 18 }} />
+      </Btn>
+      <Btn title="Download" onClick={p.onDownload}>
+        <CloudDownloadOutlined sx={{ fontSize: 18 }} />
+      </Btn>
+      <Btn title="Print" onClick={p.onPrint}>
+        <PrintOutlined sx={{ fontSize: 18 }} />
+      </Btn>
       <Btn title="Document properties" onClick={p.onProperties}>
         <InfoOutlined sx={{ fontSize: 18 }} />
       </Btn>
-      {p.showFullscreen && (
-        <Btn title={p.isFullScreen ? 'Exit full screen' : 'Full screen'} onClick={p.onFullScreen}>
-          {p.isFullScreen
-            ? <FullscreenExitOutlined sx={{ fontSize: 18 }} />
-            : <FullscreenOutlined    sx={{ fontSize: 18 }} />}
-        </Btn>
-      )}
+      <Btn title={p.isFullScreen ? 'Exit full screen' : 'Full screen'} onClick={p.onFullScreen}>
+        {p.isFullScreen
+          ? <FullscreenExitOutlined sx={{ fontSize: 18 }} />
+          : <FullscreenOutlined    sx={{ fontSize: 18 }} />}
+      </Btn>
 
       {p.fileName && (
         <Typography sx={{
@@ -1019,19 +825,16 @@ function Toolbar(p: ToolbarProps) {
 // For large documents this avoids loading all page canvases simultaneously.
 
 interface LazyThumbProps {
-  pageNum:       number;
-  pdf:           PDFDocumentProxy;
-  currentPage:   number;
-  origPageWidth: number;
-  onPageClick:   (n: number) => void;
+  pageNum:     number;
+  pdf:         PDFDocumentProxy;
+  currentPage: number;
+  onPageClick: (n: number) => void;
 }
 
-function LazyThumbnail({ pageNum: n, pdf, currentPage, origPageWidth, onPageClick }: LazyThumbProps) {
+function LazyThumbnail({ pageNum: n, pdf, currentPage, onPageClick }: LazyThumbProps) {
   const ref             = useRef<HTMLDivElement>(null);
   const [visible, setVisible] = useState(false);
   const active = n === currentPage;
-  // Use actual page width for thumb scale so non-A4 pages size correctly
-  const thumbScale = origPageWidth > 0 ? THUMB_W / origPageWidth : THUMB_W / 595;
 
   useEffect(() => {
     if (!ref.current) return;
@@ -1056,7 +859,7 @@ function LazyThumbnail({ pageNum: n, pdf, currentPage, origPageWidth, onPageClic
           <PdfPage
             pdf={pdf}
             pageNumber={n}
-            scale={thumbScale}
+            scale={THUMB_W / 595}
             rotation={0}
             renderTextLayer={false}
             renderAnnotationLayer={false}
@@ -1078,15 +881,13 @@ function LazyThumbnail({ pageNum: n, pdf, currentPage, origPageWidth, onPageClic
 
 // ─── Thumbnail sidebar ────────────────────────────────────────────────────────
 
-function ThumbnailSidebar({ pdf, numPages, currentPage, origPageWidth, onPageClick }: {
-  pdf: PDFDocumentProxy; numPages: number; currentPage: number;
-  origPageWidth: number; onPageClick: (n: number) => void;
+function ThumbnailSidebar({ pdf, numPages, currentPage, onPageClick }: {
+  pdf: PDFDocumentProxy; numPages: number; currentPage: number; onPageClick: (n: number) => void;
 }) {
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, p: 1 }}>
       {Array.from({ length: numPages }, (_, i) => (
-        <LazyThumbnail key={i + 1} pageNum={i + 1} pdf={pdf} currentPage={currentPage}
-          origPageWidth={origPageWidth} onPageClick={onPageClick} />
+        <LazyThumbnail key={i + 1} pageNum={i + 1} pdf={pdf} currentPage={currentPage} onPageClick={onPageClick} />
       ))}
     </Box>
   );
@@ -1136,7 +937,6 @@ function AttachmentsSidebar({ attachments }: { attachments: PdfAttachment[] }) {
 interface SearchPanelProps {
   query:         string;
   matchPages:    number[];
-  totalMatches:  number;
   matchIdx:      number;
   searching:     boolean;
   onQueryChange: (q: string) => void;
@@ -1144,10 +944,7 @@ interface SearchPanelProps {
   onNext:        () => void;
   onClose:       () => void;
 }
-function SearchPanel({ query, matchPages, totalMatches, matchIdx, searching, onQueryChange, onPrev, onNext, onClose }: SearchPanelProps) {
-  const resultLabel = matchPages.length === 0
-    ? 'No results'
-    : `${matchIdx + 1}/${matchPages.length} pages (${totalMatches} match${totalMatches !== 1 ? 'es' : ''})`;
+function SearchPanel({ query, matchPages, matchIdx, searching, onQueryChange, onPrev, onNext, onClose }: SearchPanelProps) {
   return (
     <Paper elevation={0} sx={{
       position: 'absolute', top: 8, right: 8, zIndex: 10,
@@ -1163,11 +960,8 @@ function SearchPanel({ query, matchPages, totalMatches, matchIdx, searching, onQ
       />
       {searching && <CircularProgress size={14} sx={{ color: T.blue }} />}
       {!searching && query && (
-        <Typography
-          aria-live="polite"
-          aria-atomic="true"
-          sx={{ fontSize: '0.72rem', color: T.textMuted, whiteSpace: 'nowrap', minWidth: 80 }}>
-          {resultLabel}
+        <Typography sx={{ fontSize: '0.72rem', color: T.textMuted, whiteSpace: 'nowrap', minWidth: 50 }}>
+          {matchPages.length === 0 ? 'No results' : `${matchIdx + 1}/${matchPages.length} pages`}
         </Typography>
       )}
       <Tooltip title="Previous match"><span>
@@ -1182,7 +976,7 @@ function SearchPanel({ query, matchPages, totalMatches, matchIdx, searching, onQ
           <NavigateNextOutlined sx={{ fontSize: 16 }} />
         </IconButton>
       </span></Tooltip>
-      <Tooltip title="Close search (Esc)"><span>
+      <Tooltip title="Close search"><span>
         <IconButton size="small" onClick={onClose}
           sx={{ color: T.textIcon, p: '2px', '&:hover': { color: T.blue } }}>
           <CloseOutlined sx={{ fontSize: 16 }} />
@@ -1237,19 +1031,12 @@ function PropertiesDialog({ open, info, onClose }: {
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
-const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function PdfViewerClient({
+export default function PdfViewerClient({
   fileUrl, fileName = 'document.pdf', onDocumentLoad,
-  onPageChange, onError, onZoomChange, onRotationChange,
-  onFullscreenChange, onScrollModeChange,
-  initialPage = 1, defaultZoom = 'page-fit',
-  defaultSidebarOpen = false, defaultSidebarTab = 'thumbnails',
+  onPageChange, onError, initialPage = 1, defaultZoom = 'page-fit',
   options, tokenResolver, tokenKey = 'access_token',
   tokenTypeKey = 'token_type', disableAuth = false,
-  showDownload = true, showPrint = true, showOpenFile = true,
-  showSidebar = true, showSearch = true, showRotation = true,
-  showFullscreen = true, allowFileOpen = true,
-  height = '100%', className, sx, theme: themeProp,
-}: PdfViewerProps, ref) {
+}: PdfViewerProps) {
   const [numPages,       setNumPages]       = useState(0);
   const [currentPage,    setCurrentPage]    = useState(initialPage);
   const [scale,          setScale]          = useState(1.0);
@@ -1257,12 +1044,11 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
   const [rotation,       setRotation]       = useState(0);
   const [scrollMode,     setScrollMode]     = useState<ScrollMode>('continuous');
   const [selectMode,     setSelectMode]     = useState<SelectMode>('text');
-  const [sidebarOpen,    setSidebarOpen]    = useState(defaultSidebarOpen);
-  const [sidebarTab,     setSidebarTab]     = useState<SidebarTab>(defaultSidebarTab);
+  const [sidebarOpen,    setSidebarOpen]    = useState(false);
+  const [sidebarTab,     setSidebarTab]     = useState<SidebarTab>('thumbnails');
   const [searchOpen,     setSearchOpen]     = useState(false);
   const [searchQuery,    setSearchQuery]    = useState('');
   const [matchPages,     setMatchPages]     = useState<number[]>([]);
-  const [totalMatches,   setTotalMatches]   = useState(0);
   const [matchIdx,       setMatchIdx]       = useState(0);
   const [isSearching,    setIsSearching]    = useState(false);
   const [isFullScreen,   setIsFullScreen]   = useState(false);
@@ -1271,85 +1057,34 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
   const [attachments,    setAttachments]    = useState<PdfAttachment[]>([]);
   const [pdfDoc,         setPdfDoc]         = useState<PDFDocumentProxy | null>(null);
   const [loadError,      setLoadError]      = useState<string | null>(null);
-  const [loadProgress,   setLoadProgress]   = useState<number | null>(null);
   const [localFileUrl,   setLocalFileUrl]   = useState<string | null>(null);
   const [localFileName,  setLocalFileName]  = useState<string>('');
   const [isDragOver,     setIsDragOver]     = useState(false);
   const [origPageWidth,  setOrigPageWidth]  = useState(0);
   const [origPageHeight, setOrigPageHeight] = useState(0);
 
-  // Merge custom theme tokens with defaults once.
-  const T = useMemo(
-    () => themeProp ? { ...DEFAULT_THEME, ...themeProp } : DEFAULT_THEME,
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [JSON.stringify(themeProp)],
-  );
-
-  const rootRef         = useRef<HTMLDivElement>(null);
-  const viewerRef       = useRef<HTMLDivElement>(null);
-  const pageRefs        = useRef<(HTMLDivElement | null)[]>([]);
-  const fileInputRef    = useRef<HTMLInputElement>(null);
-  const dragCountRef    = useRef(0); // tracks nested dragenter/dragleave to prevent flicker
-  const pdfDocRef       = useRef<PDFDocumentProxy | null>(null);
-  const downloadAbortRef = useRef<AbortController | null>(null);
-  const printAbortRef   = useRef<AbortController | null>(null);
-
-  usePdfLayerCss();
+  const rootRef      = useRef<HTMLDivElement>(null);
+  const viewerRef    = useRef<HTMLDivElement>(null);
+  const pageRefs     = useRef<(HTMLDivElement | null)[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragCountRef = useRef(0); // tracks nested dragenter/dragleave to prevent flicker
 
   const displayFile = localFileUrl || fileUrl;
   const displayName = localFileName || fileName;
 
-  // ── Dev warnings ──────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    if (process.env.NODE_ENV !== 'production') {
-      if (!disableAuth && !options?.httpHeaders && !tokenResolver) {
-        const hasToken = typeof window !== 'undefined' && (
-          window.localStorage.getItem(tokenKey) ||
-          window.localStorage.getItem(tokenTypeKey)
-        );
-        if (!hasToken) {
-          // Only warn once per mount — localStorage keys may be missing intentionally
-          console.warn(
-            '[next-react-pdf] No auth token found. Pass tokenResolver, options.httpHeaders, or set disableAuth=true.',
-          );
-        }
-      }
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    if (process.env.NODE_ENV !== 'production' && rootRef.current) {
-      const h = rootRef.current.clientHeight;
-      if (h === 0) {
-        console.warn('[next-react-pdf] Viewer has zero height. Set an explicit height via the height, sx, or className prop.');
-      }
-    }
-  });
-
   // ── Auth resolution (options → tokenResolver → localStorage) ─────────────
-  // NOTE: auth headers are read INSIDE the load effect's run() to avoid
-  // stale-token issues when tokenResolver is a closure over rotating tokens.
 
-  const buildAuthHeaders = useCallback((): Record<string, string> => {
-    if (options?.httpHeaders) return options.httpHeaders as Record<string, string>;
-    if (disableAuth) return {};
+  const resolvedOptions = useMemo<PdfDocumentOptions>(() => {
+    if (options?.httpHeaders) return options;
+    if (disableAuth) return options ?? {};
     const rawToken = tokenResolver ? tokenResolver() : null;
-    if (rawToken) return { Authorization: `Bearer ${rawToken}` };
-    if (typeof window === 'undefined') return {};
+    if (rawToken) return { ...options, httpHeaders: { Authorization: `Bearer ${rawToken}` } };
+    if (typeof window === 'undefined') return options ?? {};
     const token     = window.localStorage.getItem(tokenKey);
     const tokenType = window.localStorage.getItem(tokenTypeKey) ?? 'Bearer';
-    if (!token) return {};
-    return { Authorization: `${tokenType} ${token}` };
-  }, [options, disableAuth, tokenResolver, tokenKey, tokenTypeKey]);
-
-  // Stable options key (excludes auth headers which are read fresh each load).
-  const baseOptions = useMemo(() => {
-    const { httpHeaders: _h, ...rest } = options ?? {};
-    return rest;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [JSON.stringify(options)]);
+    if (!token) return options ?? {};
+    return { ...options, httpHeaders: { Authorization: `${tokenType} ${token}` } };
+  }, [options, tokenResolver, disableAuth, tokenKey, tokenTypeKey]);
 
   // ── LinkService instance for AnnotationLayer navigation ──────────────────
   const linkServiceRef = useRef<SimpleLinkService>(
@@ -1401,41 +1136,23 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
   // Reset + load PDF whenever the URL or auth options change.
   useEffect(() => {
     setNumPages(0);      setCurrentPage(initialPage);
-    setZoomPreset(defaultZoom as ZoomPreset);
     setOrigPageWidth(0); setOrigPageHeight(0);
     setMatchPages([]);   setSearchQuery('');
-    setTotalMatches(0);
     setAttachments([]);  setPdfProperties(null);
-    setLoadError(null);  setLoadProgress(null);
+    setLoadError(null);
     if (!displayFile) return;
-    if (!isSafeFileUrl(displayFile)) {
-      setLoadError('Unsafe file URL rejected.');
-      return;
-    }
 
     let cancelled = false;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let loadingTask: any = null;
 
     const run = async () => {
-      // Read auth headers fresh here to avoid stale-token issues.
-      const httpHeaders = buildAuthHeaders();
-      loadingTask = pdfjs.getDocument({
-        url: displayFile,
-        ...baseOptions,
-        ...(Object.keys(httpHeaders).length ? { httpHeaders } : {}),
-      });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (loadingTask as any).onProgress = ({ loaded, total }: { loaded: number; total: number }) => {
-        if (total > 0) setLoadProgress(Math.min(loaded / total, 1));
-      };
+      loadingTask = pdfjs.getDocument({ url: displayFile, ...resolvedOptions });
       const pdf: PDFDocumentProxy = await loadingTask.promise;
       if (cancelled) { pdf.destroy(); return; }
-      pdfDocRef.current = pdf;
       setPdfDoc(pdf);
       setNumPages(pdf.numPages);
       setLoadError(null);
-      setLoadProgress(null);
       onDocumentLoad?.(pdf.numPages);
       pageRefs.current = new Array(pdf.numPages).fill(null);
       // Update link service with real page count.
@@ -1476,7 +1193,6 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
       if (!cancelled) {
         const msg = err?.message || 'Failed to load PDF.';
         setLoadError(msg);
-        setLoadProgress(null);
         onError?.(err);
       }
     });
@@ -1484,12 +1200,10 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
     return () => {
       cancelled = true;
       loadingTask?.destroy?.();
-      pdfDocRef.current?.destroy();
-      pdfDocRef.current = null;
       setPdfDoc(null);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [displayFile, buildAuthHeaders, baseOptions, initialPage, defaultZoom]);
+  }, [displayFile, resolvedOptions, initialPage]);
 
   // Cleanup local blob URL on unmount.
   useEffect(() => () => { if (localFileUrl) URL.revokeObjectURL(localFileUrl); }, [localFileUrl]);
@@ -1527,38 +1241,24 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
 
   // ── Zoom actions ──────────────────────────────────────────────────────────
 
-  const handleZoomIn  = () => {
-    setZoomPreset('custom');
-    setScale((s) => { const next = Math.min(s + ZOOM_STEP, ZOOM_MAX); onZoomChange?.(next); return next; });
-  };
-  const handleZoomOut = () => {
-    setZoomPreset('custom');
-    setScale((s) => { const next = Math.max(s - ZOOM_STEP, ZOOM_MIN); onZoomChange?.(next); return next; });
-  };
+  const handleZoomIn  = () => { setZoomPreset('custom'); setScale((s) => Math.min(s + ZOOM_STEP, ZOOM_MAX)); };
+  const handleZoomOut = () => { setZoomPreset('custom'); setScale((s) => Math.max(s - ZOOM_STEP, ZOOM_MIN)); };
   const handleZoomSelect = (value: number | null, preset: ZoomPreset) => {
     setZoomPreset(preset);
-    if (value !== null) { setScale(value); onZoomChange?.(value); }
+    if (value !== null) setScale(value);
     else if (origPageWidth && origPageHeight) computeFitScale(origPageWidth, origPageHeight);
   };
 
-  const handleRotateLeft  = () => {
-    setRotation((r) => { const next = (r - 90 + 360) % 360; onRotationChange?.(next); return next; });
-  };
-  const handleRotateRight = () => {
-    setRotation((r) => { const next = (r + 90) % 360; onRotationChange?.(next); return next; });
-  };
+  const handleRotateLeft  = () => setRotation((r) => (r - 90 + 360) % 360);
+  const handleRotateRight = () => setRotation((r) => (r + 90) % 360);
 
   // ── Full screen ───────────────────────────────────────────────────────────
 
   useEffect(() => {
-    const onChange = () => {
-      const fs = !!document.fullscreenElement;
-      setIsFullScreen(fs);
-      onFullscreenChange?.(fs);
-    };
+    const onChange = () => setIsFullScreen(!!document.fullscreenElement);
     document.addEventListener('fullscreenchange', onChange);
     return () => document.removeEventListener('fullscreenchange', onChange);
-  }, [onFullscreenChange]);
+  }, []);
 
   const handleFullScreen = () => {
     if (!rootRef.current) return;
@@ -1571,7 +1271,6 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (e.key === 'Escape') { setSearchOpen(false); setSearchQuery(''); return; }
       if (numPages === 0) return; // no document loaded
       if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); goToPage(currentPage + 1); }
       if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')   { e.preventDefault(); goToPage(currentPage - 1); }
@@ -1583,55 +1282,26 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
     return () => window.removeEventListener('keydown', onKey);
   }, [currentPage, numPages, goToPage]);
 
-  // ── Text search with debounce and parallel concurrency ───────────────────
+  // ── Text search with debounce ─────────────────────────────────────────────
 
   useEffect(() => {
-    if (!pdfDoc || !searchQuery.trim()) {
-      setMatchPages([]);
-      setTotalMatches(0);
-      setMatchIdx(0);
-      return;
-    }
+    if (!pdfDoc || !searchQuery.trim()) { setMatchPages([]); setMatchIdx(0); return; }
     const query = searchQuery.trim().toLowerCase();
     let cancelled = false;
     let timerId: ReturnType<typeof setTimeout>;
 
     timerId = setTimeout(async () => {
       setIsSearching(true);
-      const total = pdfDoc.numPages;
       const hits: number[] = [];
-      let matchCount = 0;
-
-      // Process pages in batches of SEARCH_CONCURRENCY for speed.
-      for (let start = 1; start <= total; start += SEARCH_CONCURRENCY) {
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
         if (cancelled) return;
-        const batch = Array.from(
-          { length: Math.min(SEARCH_CONCURRENCY, total - start + 1) },
-          (_, k) => start + k,
-        );
-        const results = await Promise.all(batch.map(async (i) => {
-          const page = await pdfDoc.getPage(i);
-          const tc   = await page.getTextContent();
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const text = tc.items.map((it: any) => it.str ?? '').join(' ').toLowerCase();
-          // Count occurrences on this page.
-          let count = 0;
-          let pos = 0;
-          while ((pos = text.indexOf(query, pos)) !== -1) { count++; pos += query.length; }
-          return { pageNum: i, found: count > 0, count };
-        }));
-        for (const r of results) {
-          if (r.found) hits.push(r.pageNum);
-          matchCount += r.count;
-        }
+        const page = await pdfDoc.getPage(i);
+        const tc   = await page.getTextContent();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const text = tc.items.map((it: any) => it.str ?? '').join(' ').toLowerCase();
+        if (text.includes(query)) hits.push(i);
       }
-
-      if (!cancelled) {
-        setMatchPages(hits);
-        setTotalMatches(matchCount);
-        setMatchIdx(0);
-        setIsSearching(false);
-      }
+      if (!cancelled) { setMatchPages(hits); setMatchIdx(0); setIsSearching(false); }
     }, SEARCH_DEBOUNCE_MS);
 
     return () => { cancelled = true; clearTimeout(timerId); };
@@ -1668,30 +1338,17 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
 
   const handleDownload = async () => {
     if (!displayFile) return;
-    downloadAbortRef.current?.abort();
-    const controller = new AbortController();
-    downloadAbortRef.current = controller;
-    let blobUrl: string | null = null;
     try {
-      const headers = buildAuthHeaders();
-      const res  = await fetch(displayFile, {
-        headers,
-        signal: controller.signal,
-      });
+      const res  = await fetch(displayFile, { headers: resolvedOptions?.httpHeaders ?? {} });
       const blob = await res.blob();
-      blobUrl = URL.createObjectURL(blob);
-      const a = Object.assign(document.createElement('a'), { href: blobUrl, download: displayName });
+      const url  = URL.createObjectURL(blob);
+      const a    = Object.assign(document.createElement('a'), { href: url, download: displayName });
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-    } catch (err: unknown) {
-      // Ignore abort errors; for other errors fall back to window.open only if no auth.
-      if (err instanceof Error && err.name !== 'AbortError') {
-        const hasAuth = Object.keys(buildAuthHeaders()).length > 0;
-        if (!hasAuth) window.open(displayFile, '_blank', 'noopener,noreferrer');
-      }
-    } finally {
-      if (blobUrl) URL.revokeObjectURL(blobUrl);
+      URL.revokeObjectURL(url);
+    } catch {
+      window.open(displayFile, '_blank', 'noopener,noreferrer');
     }
   };
 
@@ -1699,64 +1356,37 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
 
   const handlePrint = async () => {
     if (!displayFile) return;
-    printAbortRef.current?.abort();
-    const controller = new AbortController();
-    printAbortRef.current = controller;
-    let blobUrl: string | null = null;
-    let iframe: HTMLIFrameElement | null = null;
-
-    const cleanup = () => {
-      if (iframe && document.body.contains(iframe)) document.body.removeChild(iframe);
-      if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
-    };
-
     try {
-      const headers = buildAuthHeaders();
-      const res = await fetch(displayFile, { headers, signal: controller.signal });
+      const res  = await fetch(displayFile, { headers: resolvedOptions?.httpHeaders ?? {} });
       const blob = await res.blob();
-      blobUrl = URL.createObjectURL(blob);
-
-      iframe = document.createElement('iframe');
+      const url  = URL.createObjectURL(blob);
+      const iframe = document.createElement('iframe');
       iframe.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;';
-      iframe.src = blobUrl;
-
-      const onAfterPrint = () => {
-        window.removeEventListener('afterprint', onAfterPrint);
-        cleanup();
-      };
-      window.addEventListener('afterprint', onAfterPrint);
-
-      iframe.onerror = () => {
-        window.removeEventListener('afterprint', onAfterPrint);
-        cleanup();
-      };
-
+      iframe.src = url;
       document.body.appendChild(iframe);
       iframe.onload = () => {
         setTimeout(() => {
-          iframe?.contentWindow?.focus();
-          iframe?.contentWindow?.print();
+          iframe.contentWindow?.focus();
+          iframe.contentWindow?.print();
+          setTimeout(() => {
+            if (document.body.contains(iframe)) document.body.removeChild(iframe);
+            URL.revokeObjectURL(url);
+          }, 3000);
         }, 500);
       };
-    } catch (err: unknown) {
-      cleanup();
-      if (err instanceof Error && err.name !== 'AbortError') {
-        // Fallback: open without auth (only safe for public PDFs).
-        const hasAuth = Object.keys(buildAuthHeaders()).length > 0;
-        if (!hasAuth) {
-          iframe = document.createElement('iframe');
-          iframe.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;';
-          iframe.src = displayFile;
-          document.body.appendChild(iframe);
-          iframe.onload = () => {
-            setTimeout(() => {
-              iframe?.contentWindow?.focus();
-              iframe?.contentWindow?.print();
-              setTimeout(() => { if (iframe && document.body.contains(iframe)) document.body.removeChild(iframe); }, 3000);
-            }, 500);
-          };
-        }
-      }
+    } catch {
+      // fallback — no auth
+      const iframe = document.createElement('iframe');
+      iframe.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;';
+      iframe.src = displayFile;
+      document.body.appendChild(iframe);
+      iframe.onload = () => {
+        setTimeout(() => {
+          iframe.contentWindow?.focus();
+          iframe.contentWindow?.print();
+          setTimeout(() => { if (document.body.contains(iframe)) document.body.removeChild(iframe); }, 3000);
+        }, 500);
+      };
     }
   };
 
@@ -1766,92 +1396,6 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
     if (sidebarOpen && sidebarTab === tab) setSidebarOpen(false);
     else { setSidebarOpen(true); setSidebarTab(tab); }
   };
-
-  // ── Scroll mode ───────────────────────────────────────────────────────────
-
-  const handleScrollToggle = () => {
-    setScrollMode((m) => {
-      const next = m === 'continuous' ? 'single' : 'continuous';
-      onScrollModeChange?.(next);
-      return next;
-    });
-  };
-
-  // ── Hand-panning ──────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    const el = viewerRef.current;
-    if (!el || selectMode !== 'hand') return;
-    let isDown = false;
-    let startX = 0, startY = 0, scrollLeft = 0, scrollTop = 0;
-    const onMouseDown = (e: MouseEvent) => {
-      isDown = true;
-      startX = e.pageX - el.offsetLeft;
-      startY = e.pageY - el.offsetTop;
-      scrollLeft = el.scrollLeft;
-      scrollTop  = el.scrollTop;
-      el.style.cursor = 'grabbing';
-    };
-    const onMouseUp   = () => { isDown = false; el.style.cursor = 'grab'; };
-    const onMouseMove = (e: MouseEvent) => {
-      if (!isDown) return;
-      e.preventDefault();
-      el.scrollLeft = scrollLeft - (e.pageX - el.offsetLeft - startX);
-      el.scrollTop  = scrollTop  - (e.pageY - el.offsetTop  - startY);
-    };
-    el.addEventListener('mousedown', onMouseDown);
-    window.addEventListener('mouseup', onMouseUp);
-    el.addEventListener('mousemove', onMouseMove);
-    return () => {
-      el.removeEventListener('mousedown', onMouseDown);
-      window.removeEventListener('mouseup', onMouseUp);
-      el.removeEventListener('mousemove', onMouseMove);
-      el.style.cursor = '';
-    };
-  }, [selectMode]);
-
-  // ── Outline navigation ────────────────────────────────────────────────────
-
-  const navigateToDest = useCallback(async (dest: string | unknown[] | null) => {
-    if (!pdfDoc || dest == null) return;
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let resolvedDest: any[] | null = null;
-      if (typeof dest === 'string') {
-        resolvedDest = await pdfDoc.getDestination(dest);
-      } else if (Array.isArray(dest)) {
-        resolvedDest = dest;
-      }
-      if (!resolvedDest || resolvedDest.length === 0) return;
-      const ref = resolvedDest[0];
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const pageIndex = await (pdfDoc as any).getPageIndex(ref);
-      goToPage(pageIndex + 1);
-    } catch {
-      // Silently ignore unresolvable destinations.
-    }
-  }, [pdfDoc, goToPage]);
-
-  // ── Imperative handle ─────────────────────────────────────────────────────
-
-  useImperativeHandle(ref, () => ({
-    goToPage: (page: number) => goToPage(page),
-    zoomTo: (zoom: number | 'page-fit' | 'page-width') => {
-      if (typeof zoom === 'number') {
-        setZoomPreset('custom');
-        setScale(Math.max(ZOOM_MIN, Math.min(zoom, ZOOM_MAX)));
-      } else {
-        setZoomPreset(zoom);
-        if (origPageWidth && origPageHeight) computeFitScale(origPageWidth, origPageHeight);
-      }
-    },
-    openSearch:   () => setSearchOpen(true),
-    closeSearch:  () => { setSearchOpen(false); setSearchQuery(''); },
-    rotateLeft:   handleRotateLeft,
-    rotateRight:  handleRotateRight,
-    getCurrentPage: () => currentPage,
-    getNumPages:    () => numPages,
-  }), [goToPage, origPageWidth, origPageHeight, computeFitScale, handleRotateLeft, handleRotateRight, currentPage, numPages]);
 
   // ── Custom text renderer (search highlighting) ────────────────────────────
 
@@ -1864,9 +1408,8 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
   if (!displayFile) return (
     <Box sx={{
       display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-      height, overflow: 'hidden', gap: 2, backgroundColor: T.viewerBg, color: T.textMuted,
-      ...(sx as object),
-    }} className={className}>
+      height: '100%', gap: 2, backgroundColor: T.viewerBg, color: T.textMuted,
+    }}>
       <PictureAsPdfOutlined sx={{ fontSize: 64, color: T.blue, opacity: 0.25 }} />
       <Typography variant="body2" sx={{ color: T.textPrimary, fontWeight: 500 }}>
         Select a document to view it.
@@ -1878,39 +1421,15 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
   );
 
   return (
-    <Box ref={rootRef} className={className} sx={{
-      display: 'flex', flexDirection: 'column', height, overflow: 'hidden',
+    <Box ref={rootRef} sx={{
+      display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden',
       backgroundColor: T.toolbarBg, userSelect: selectMode === 'hand' ? 'none' : 'text',
-      ...(sx as object),
     }}>
-      {/* Accessible aria-live status region */}
-      <Box
-        role="status"
-        aria-live="polite"
-        aria-atomic="true"
-        sx={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0,0,0,0)', whiteSpace: 'nowrap' }}
-      >
-        {isSearching
-          ? 'Searching…'
-          : matchPages.length > 0
-            ? `Found ${matchPages.length} pages (${totalMatches} matches) for "${searchQuery}"`
-            : searchQuery.trim() ? 'No results found.' : ''}
-      </Box>
-
       <input
         ref={fileInputRef} type="file" accept="application/pdf" style={{ display: 'none' }}
         onChange={(e) => { const f = e.target.files?.[0]; if (f) applyLocalFile(f); e.target.value = ''; }}
         aria-label="Open local PDF file"
       />
-
-      {/* Load progress */}
-      {loadProgress !== null && loadProgress < 1 && (
-        <LinearProgress
-          variant="determinate"
-          value={loadProgress * 100}
-          sx={{ height: 3, backgroundColor: T.blueHover, '& .MuiLinearProgress-bar': { backgroundColor: T.blue } }}
-        />
-      )}
 
       <Toolbar
         numPages={numPages}       currentPage={currentPage}
@@ -1927,22 +1446,15 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
         onZoomIn={handleZoomIn}   onZoomOut={handleZoomOut}
         onZoomSelect={handleZoomSelect}
         onRotateLeft={handleRotateLeft} onRotateRight={handleRotateRight}
-        onScrollToggle={handleScrollToggle}
+        onScrollToggle={() => setScrollMode((m) => m === 'continuous' ? 'single' : 'continuous')}
         onSelectToggle={() => setSelectMode((m) => m === 'text' ? 'hand' : 'text')}
         onFullScreen={handleFullScreen}
-        onOpenFile={() => allowFileOpen && fileInputRef.current?.click()}
+        onOpenFile={() => fileInputRef.current?.click()}
         onDownload={handleDownload}
         onPrint={handlePrint}
         onProperties={() => setPropertiesOpen(true)}
         onSidebarTab={handleSidebarTab}
         onSearchToggle={() => setSearchOpen((v) => !v)}
-        showDownload={showDownload}
-        showPrint={showPrint}
-        showOpenFile={showOpenFile && allowFileOpen}
-        showSidebar={showSidebar}
-        showSearch={showSearch}
-        showRotation={showRotation}
-        showFullscreen={showFullscreen}
       />
 
       <Box sx={{ flex: 1, display: 'flex', overflow: 'hidden', position: 'relative', minHeight: 0 }}>
@@ -1982,17 +1494,13 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
               '&::-webkit-scrollbar-thumb': { backgroundColor: T.scrollThumb, borderRadius: 2 },
             }}>
               {sidebarTab === 'thumbnails' && pdfDoc && numPages > 0 && (
-                <ThumbnailSidebar
-                  pdf={pdfDoc}
-                  numPages={numPages}
-                  currentPage={currentPage}
-                  onPageClick={goToPage}
-                  origPageWidth={origPageWidth}
-                />
+                <ThumbnailSidebar pdf={pdfDoc} numPages={numPages} currentPage={currentPage} onPageClick={goToPage} />
               )}
               {sidebarTab === 'outline' && (
                 <Box sx={{ p: 1 }}>
-                  <PdfOutline pdf={pdfDoc} onItemClick={(dest) => navigateToDest(dest)} />
+                  <PdfOutline pdf={pdfDoc} onItemClick={(dest) => {
+                    if (typeof dest === 'number') goToPage(dest + 1);
+                  }} />
                 </Box>
               )}
               {sidebarTab === 'attachments' && (
@@ -2034,7 +1542,6 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
           {searchOpen && (
             <SearchPanel
               query={searchQuery} matchPages={matchPages}
-              totalMatches={totalMatches}
               matchIdx={matchIdx} searching={isSearching}
               onQueryChange={setSearchQuery}
               onPrev={() => setMatchIdx((i) => (i - 1 + matchPages.length) % matchPages.length)}
@@ -2064,8 +1571,6 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
                       customTextRenderer={searchQuery ? customTextRenderer : undefined}
                       onLoadSuccess={n === 1 ? handlePageLoadSuccess : undefined}
                       linkService={linkServiceRef.current}
-                      estimatedWidth={origPageWidth || undefined}
-                      estimatedHeight={origPageHeight || undefined}
                     />
                   </Paper>
                 </Box>
@@ -2083,8 +1588,6 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
                       customTextRenderer={searchQuery ? customTextRenderer : undefined}
                       onLoadSuccess={handlePageLoadSuccess}
                       linkService={linkServiceRef.current}
-                      estimatedWidth={origPageWidth || undefined}
-                      estimatedHeight={origPageHeight || undefined}
                     />
                   </Paper>
                 </Box>
@@ -2098,8 +1601,4 @@ const PdfViewerClient = forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
       <PropertiesDialog open={propertiesOpen} info={pdfProperties} onClose={() => setPropertiesOpen(false)} />
     </Box>
   );
-});
-
-PdfViewerClient.displayName = 'PdfViewerClient';
-
-export default PdfViewerClient;
+}
